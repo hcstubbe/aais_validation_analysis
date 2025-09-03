@@ -1,0 +1,15 @@
+services:
+
+  rstudio:
+    image: rocker/rstudio:4.2.1
+    restart: always
+    environment:
+      PASSWORD: test123
+    ports:
+      - 9090:8787
+    volumes:
+      - ${DOCKER_DATA_PATH}/:/home/rstudio
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure

@@ -1,0 +1,3112 @@
+---
+title: "YEARS LLM Study"
+author: "HCS"
+output:
+  html_document:
+    theme: united
+    toc_float: yes
+    toc: yes
+    number_sections: yes
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+# Prepare analysis
+
+## Required packages
+
+Load the R packages required for the analysis.
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+packages <- c(
+  "tidyverse",        # Data handling  
+  "readxl",           # Read xlsx files  
+  "compareGroups",    # Descriptive statistics and tables  
+  "caret",            # Calculate sensitivity, specificity, and predictive values  
+  "ggpubr",           # Visualization  
+  "ggrepel",          # Visualization  
+  "kableExtra",       # Render tables  
+  "DT",               # Tables  
+  "randomForest",     # Random forests  
+  "randomForestExplainer", # Explain random forests  
+  "scales",           # For plotting
+  "viridis",          # For plotting
+  "ggthemes",         # For plotting
+  "ggforce",          # For plotting
+  "grid",             # For plotting
+  "webr",             # For plotting
+  "forcats"           # For plotting
+)
+
+# Install missing packages
+missing_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+if(length(missing_packages) > 0) {
+  install.packages(missing_packages)
+}
+
+# Load all required packages dynamically
+lapply(packages, require, character.only = TRUE)
+```
+
+## Define functions
+
+Custom functions used in the analysis.
+
+```{r}
+
+# Token converter
+convert_tokens = function(token_input) {
+  token_str = as.character(token_input)
+  if (grepl("M", token_str)) {
+    return(as.numeric(sub("M", "", token_str)) / 1000)
+  } else if (grepl("B", token_str)) {
+    return(as.numeric(sub("B", "", token_str)))
+  } else if (grepl("GB", token_str)) { # Convert model size
+    return(as.numeric(sub("B", "", token_str)))
+  } else {
+    return(as.numeric(token_str))
+  }
+}
+
+# Map model families
+model_families <- tibble::tibble(
+  pattern = c(
+    "aya",
+    "deepseek",
+    "everythinglm",
+    "gemma2|gemma-2|gemma 2",
+    "gemma3|gemma-3|gemma 3",
+    "hermes3",
+    "internlm2",
+    "llama2-uncensored",
+    "llama3|llama-3|llama 3",
+    "llama4|llama-4|llama 4",
+    "llava",
+    "medllama2",
+    "meditron",
+    "mistral",
+    "nemotron",
+    "phi3|phi-3|phi 3",
+    "qwen2.5|qwen-2.5|qwen 2.5",
+    "qwen3|qwen-3|qwen 3",
+    "qwq",
+    "smollm",
+    "tinyllama",
+    "tulu3",
+    "yi"
+  ),
+  family = c(
+    "aya",
+    "deepseek-r1",
+    "everythinglm",
+    "gemma2",
+    "gemma3",
+    "hermes3",
+    "internlm2",
+    "llama2-uncensored",
+    "llama3",
+    "llama4",
+    "llava",
+    "medllama2",
+    "meditron",
+    "mistral",
+    "nemotron",
+    "phi3",
+    "qwen2.5",
+    "qwen3",
+    "qwq",
+    "smollm",
+    "tinyllama",
+    "tulu3",
+    "yi"
+  )
+)
+
+get_family <- function(model_names) {
+  idx <- vapply(
+    tolower(model_names),
+    function(x) {
+      w <- which(stringr::str_detect(x, model_families$pattern))[1]
+      if (is.na(w)) NA_integer_ else w
+    },
+    integer(1)
+  )
+  fam <- model_families$family[idx]
+  fam[is.na(fam)] <- "OTHER"
+  fam
+}
+
+
+# Map common anticoagulants
+anticoagulant_map <- tibble::tibble(
+  pattern = c(
+    "heparin",
+    "low molecular weight heparin|lmwh|enoxaparin|dalteparin|tinzaparin|nadroparin",
+    "fondaparinux",
+    "warfarin|phenprocoumon|acenocoumarol|phenindione",
+    "argatroban|bivalirudin|dabigatran",
+    "rivaroxaban|apixaban|edoxaban|betrixaban"
+  ),
+  class = c(
+    "UFH",    # Unfractionated heparin
+    "LMWH",   # Low-molecular-weight heparin
+    "SP",     # Synthetic pentasaccharide
+    "VKA",    # Vitamin K antagonist
+    "DTI",    # Direct thrombin inhibitor
+    "FXaI"    # Direct factor Xa inhibitor
+  )
+)
+
+get_anticoagulant_class <- function(substances) {
+  idx <- vapply(
+    tolower(substances),
+    function(x) {
+      w <- which(stringr::str_detect(x, anticoagulant_map$pattern))[1]
+      if (is.na(w)) NA_integer_ else w
+    },
+    integer(1)
+  )
+  classes <- anticoagulant_map$class[idx]
+  classes[is.na(classes)] <- "OTHER"
+  classes
+}
+
+
+# Compute performances
+get_perf <- function(confusion_mtx, prevalence) {
+  res <- list()
+  
+  # Sensitivity
+  res$sensitivity <- sensitivity(confusion_mtx, positive = "yes")
+  res$sensitivity_error <- sqrt(res$sensitivity * (1 - res$sensitivity) / sum(confusion_mtx[, 1]))
+  res$sensitivity_lower_ci <- res$sensitivity - 1.96 * res$sensitivity_error
+  res$sensitivity_upper_ci <- res$sensitivity + 1.96 * res$sensitivity_error
+  
+  # Specificity
+  res$specificity <- specificity(confusion_mtx, negative = "no")
+  res$specificity_error <- sqrt(res$specificity * (1 - res$specificity) / sum(confusion_mtx[, 2]))
+  res$specificity_lower_ci <- res$specificity - 1.96 * res$specificity_error
+  res$specificity_upper_ci <- res$specificity + 1.96 * res$specificity_error
+  
+  # PPV
+  res$ppv <- posPredValue(confusion_mtx, prevalence = prevalence, positive = "yes")
+  res$ppv_error <- sqrt(res$ppv * (1 - res$ppv) / sum(confusion_mtx[1, ]))
+  res$ppv_lower_ci <- res$ppv - 1.96 * res$ppv_error
+  res$ppv_upper_ci <- res$ppv + 1.96 * res$ppv_error
+  
+  # NPV
+  res$npv <- negPredValue(confusion_mtx, prevalence = prevalence, negative = "no")
+  res$npv_error <- sqrt(res$npv * (1 - res$npv) / sum(confusion_mtx[2, ]))
+  res$npv_lower_ci <- res$npv - 1.96 * res$npv_error
+  res$npv_upper_ci <- res$npv + 1.96 * res$npv_error
+  
+  # Accuracy
+  res$accuracy <- sum(diag(confusion_mtx)) / sum(confusion_mtx)
+  res$accuracy_error <- sqrt(res$accuracy * (1 - res$accuracy) / sum(confusion_mtx))
+  res$accuracy_lower_ci <- res$accuracy - 1.96 * res$accuracy_error
+  res$accuracy_upper_ci <- res$accuracy + 1.96 * res$accuracy_error
+  
+  # Counts
+  TP = confusion_mtx["yes", "yes"]
+  FP = confusion_mtx["yes", "no"]
+  FN = confusion_mtx["no", "yes"]
+  TN = confusion_mtx["no", "no"]
+  total = sum(confusion_mtx)
+  
+  res$TP <- TP
+  ci <- poisson.test(TP)$conf.int; res$TP_lower_ci <- ci[1]; res$TP_upper_ci <- ci[2]
+  res$FP <- FP
+  ci <- poisson.test(FP)$conf.int; res$FP_lower_ci <- ci[1]; res$FP_upper_ci <- ci[2]
+  res$FN <- FN
+  ci <- poisson.test(FN)$conf.int; res$FN_lower_ci <- ci[1]; res$FN_upper_ci <- ci[2]
+  res$TN <- TN
+  ci <- poisson.test(TN)$conf.int; res$TN_lower_ci <- ci[1]; res$TN_upper_ci <- ci[2]
+  
+  # Prevalence
+  res$computed_prevalence <- (TP + FN) / total
+  res$computed_prevalence_error <- sqrt(res$computed_prevalence * (1 - res$computed_prevalence) / total)
+  res$computed_prevalence_lower_ci <- res$computed_prevalence - 1.96 * res$computed_prevalence_error
+  res$computed_prevalence_upper_ci <- res$computed_prevalence + 1.96 * res$computed_prevalence_error
+  
+  # Balanced Accuracy
+  res$balanced_accuracy <- (res$sensitivity + res$specificity) / 2
+  ba_err <- sqrt(res$sensitivity_error^2 + res$specificity_error^2) / 2
+  res$balanced_accuracy_lower_ci <- res$balanced_accuracy - 1.96 * ba_err
+  res$balanced_accuracy_upper_ci <- res$balanced_accuracy + 1.96 * ba_err
+  
+  # F1 Score
+  denom_f1 <- (2 * TP + FP + FN)
+  if (denom_f1 == 0) {
+    res$f1_score <- res$f1_score_error <- res$f1_score_lower_ci <- res$f1_score_upper_ci <- NA
+  } else {
+    res$f1_score <- 2 * TP / denom_f1
+    dTP <- 2 * (FP + FN) / (denom_f1^2)
+    dFP <- -2 * TP / (denom_f1^2)
+    dFN <- -2 * TP / (denom_f1^2)
+    n_pos <- TP + FN; n_neg <- FP + TN
+    var_TP <- n_pos * res$sensitivity * (1 - res$sensitivity)
+    var_FN <- n_pos * res$sensitivity * (1 - res$sensitivity)
+    var_FP <- if (n_neg > 0) n_neg * res$specificity * (1 - res$specificity) else NA
+    var_f1 <- dTP^2 * var_TP + dFP^2 * var_FP + dFN^2 * var_FN
+    res$f1_score_error <- sqrt(var_f1)
+    res$f1_score_lower_ci <- res$f1_score - 1.96 * res$f1_score_error
+    res$f1_score_upper_ci <- res$f1_score + 1.96 * res$f1_score_error
+  }
+  
+  # MCC
+  mcc_den <- sqrt(as.numeric(TP + FP) * as.numeric(TP + FN) * as.numeric(TN + FP) * as.numeric(TN + FN))
+  res$mcc <- ifelse(mcc_den == 0, NA, (TP * TN - FP * FN) / mcc_den)
+  if (!is.na(res$mcc)) {
+    if (total > 3) {
+      fisher_z <- 0.5 * log((1 + res$mcc) / (1 - res$mcc))
+      se_z <- 1 / sqrt(total - 3)
+      z_lower <- fisher_z - 1.96 * se_z
+      z_upper <- fisher_z + 1.96 * se_z
+      res$mcc_lower_ci <- (exp(2 * z_lower) - 1) / (exp(2 * z_lower) + 1)
+      res$mcc_upper_ci <- (exp(2 * z_upper) - 1) / (exp(2 * z_upper) + 1)
+    } else {
+      res$mcc_lower_ci <- res$mcc_upper_ci <- NA
+    }
+  } else {
+    res$mcc_lower_ci <- res$mcc_upper_ci <- NA
+  }
+  
+  # Miscellaneous
+  res$misclassification_rate <- 1 - res$accuracy
+  res$misclassification_rate_lower_ci <- 1 - res$accuracy_upper_ci
+  res$misclassification_rate_upper_ci <- 1 - res$accuracy_lower_ci
+  
+  res$youden_index <- res$sensitivity + res$specificity - 1
+  yi_err <- sqrt(res$sensitivity_error^2 + res$specificity_error^2)
+  res$youden_index_lower_ci <- res$youden_index - 1.96 * yi_err
+  res$youden_index_upper_ci <- res$youden_index + 1.96 * yi_err
+  
+  res$youden_index_sens <- res$sensitivity * 1.5 + res$specificity - 1
+  yi_err_sens <- sqrt((1.5 * res$sensitivity_error)^2 + res$specificity_error^2)
+  res$youden_index_lower_ci_sens <- res$youden_index_sens - 1.96 * yi_err_sens
+  res$youden_index_upper_ci_sens <- res$youden_index_sens + 1.96 * yi_err_sens
+  
+  # LR+ and LR-
+  if (is.na(res$specificity) || (1 - res$specificity) == 0) {
+    res$lr_plus <- res$lr_plus_lower_ci <- res$lr_plus_upper_ci <- NA
+  } else {
+    res$lr_plus <- res$sensitivity / (1 - res$specificity)
+    se_log_lr_plus <- sqrt((res$sensitivity_error / res$sensitivity)^2 +
+                           (res$specificity_error / (1 - res$specificity))^2)
+    lr_log <- log(res$lr_plus)
+    res$lr_plus_lower_ci <- exp(lr_log - 1.96 * se_log_lr_plus)
+    res$lr_plus_upper_ci <- exp(lr_log + 1.96 * se_log_lr_plus)
+  }
+  
+  if (is.na(res$specificity) || res$specificity == 0) {
+    res$lr_minus <- res$lr_minus_lower_ci <- res$lr_minus_upper_ci <- NA
+  } else {
+    res$lr_minus <- (1 - res$sensitivity) / res$specificity
+    se_log_lr_minus <- sqrt((res$sensitivity_error / (1 - res$sensitivity))^2 +
+                            (res$specificity_error / res$specificity)^2)
+    lr_minus_log <- log(res$lr_minus)
+    res$lr_minus_lower_ci <- exp(lr_minus_log - 1.96 * se_log_lr_minus)
+    res$lr_minus_upper_ci <- exp(lr_minus_log + 1.96 * se_log_lr_minus)
+  }
+  
+  # DOR
+  if (FP * FN == 0) {
+    res$diagnostic_odds_ratio <- res$diagnostic_odds_ratio_lower_ci <- res$diagnostic_odds_ratio_upper_ci <- NA
+  } else {
+    res$diagnostic_odds_ratio <- (TP * TN) / (FP * FN)
+    se_log_dor <- sqrt(1 / TP + 1 / FP + 1 / FN + 1 / TN)
+    dor_log <- log(res$diagnostic_odds_ratio)
+    res$diagnostic_odds_ratio_lower_ci <- exp(dor_log - 1.96 * se_log_dor)
+    res$diagnostic_odds_ratio_upper_ci <- exp(dor_log + 1.96 * se_log_dor)
+  }
+  
+  # Round proportion metrics to [0,1]
+  metrics_bound_0_1 <- c("sensitivity", "specificity", "ppv", "npv", "accuracy",
+                         "balanced_accuracy", "misclassification_rate", "computed_prevalence",
+                         "f1_score", "sensitivity_lower_ci", "sensitivity_upper_ci",
+                         "specificity_lower_ci", "specificity_upper_ci", "ppv_lower_ci", "ppv_upper_ci",
+                         "npv_lower_ci", "npv_upper_ci", "accuracy_lower_ci",
+                         "accuracy_upper_ci", "computed_prevalence_lower_ci", "computed_prevalence_upper_ci",
+                         "balanced_accuracy_lower_ci", "balanced_accuracy_upper_ci",
+                         "f1_score_lower_ci", "f1_score_upper_ci", "youden_index", "youden_index_lower_ci",
+                         "youden_index_upper_ci")
+  
+  res <- mapply(function(x, nm) {
+    if (is.numeric(x) && !is.na(x)) {
+      if (nm %in% metrics_bound_0_1)
+        round(min(max(x, 0), 1), 3)
+      else round(x, 3)
+    } else {
+      x
+    }
+  }, res, names(res), SIMPLIFY = FALSE)
+  
+  return(unlist(res))
+}
+
+
+# Create confusion matrices
+create_cf_mtx = function(target, response_data, model){
+  cf_mtx = table(
+    response_data[response_data$model == model & response_data$llm_scenario == target["scenario"], c("validation__actual_bool_llm_response", "validation__correct_bool_llm_response")])
+  
+  # Write model to file
+  write(model, file = "data/confusion_matrices.txt", append = TRUE)
+  
+  # Write confusion matrix to file without column names when appending
+  write.table(cf_mtx, file = "data/confusion_matrices.txt", append = TRUE, sep = "\t", col.names = !file.exists("data/confusion_matrices.txt"))
+  
+  get_perf(cf_mtx, 0.1)
+}
+
+# Compute summary statistics for each model
+get_model_summary = function(model, target_list, response_data){
+  model_res = sapply(target_list, 
+                     create_cf_mtx, 
+                     response_data=response_data, 
+                     model=model) %>%
+              t()
+  model_res = data.frame(scenario = names(target_list), model = model, model_res, check.names = FALSE)
+  model_res
+}
+
+
+# Function to convert variables to factors, excluding typically numeric ones 
+convert_to_factor = function(df) { df %>% mutate(across(where(is.character), as.factor)) %>% mutate(across(matches("demographic__sex|assessment__pe_most_likely_diagnosis|sign__pain_on_lower_limb_palpation_and_unilateral_edema|sign__hemoptysis|symptom__chest_pain|symptom__dyspnea|symptom__syncope|outcome__death|history__previous_pe_or_dvt|history__immobilisation_or_surgery"), as.factor)) }
+
+capitalize_first_char = function(x) {
+  substr(x, 1, 1) = toupper(substr(x, 1, 1)) 
+  return(x) 
+}
+
+
+compute_and_plot_stepwise_conf <- function(resp_dat, title) {
+  
+  # Check if the outcome column exists
+  if (!"outcome__pulmonary_embolism" %in% names(resp_dat)) {
+    stop("Column outcome__pulmonary_embolism is missing.")
+  }
+  
+  # Convert outcome to a numeric indicator: "yes" becomes 1, otherwise 0
+  resp_dat <- resp_dat %>%
+    mutate(
+      outcome_indicator = ifelse(outcome__pulmonary_embolism == "yes", 1, 0)
+    )
+  
+  # Define diagnostic test indicators for each step:
+  # Step 1: Evaluation is considered positive if response_evaluation_for_pe equals "yes"
+  # Step 2: Diagnosis is positive if the evaluation did not rule out PE (i.e. not "no")
+  #         and the most likely diagnosis is "yes"
+  # Step 3: D-dimer is positive if evaluation did not rule out PE and either the most likely 
+  #         diagnosis or the d-dimer test is "yes"
+  # Step 4: CTPA is positive if response_pe_ctpa equals "yes"
+  resp_dat <- resp_dat %>%
+    mutate(
+      eval_indicator   = ifelse(response_evaluation_for_pe == "yes", 1, 0),
+      diag_indicator   = ifelse(response_evaluation_for_pe != "no" & response_pe_most_likely_diagnosis == "yes", 1, 0),
+      ddimer_indicator = ifelse(response_evaluation_for_pe != "no" &
+                                (response_pe_most_likely_diagnosis == "yes" | response_pe_d_dimer == "yes"), 1, 0),
+      ctpa_indicator   = ifelse(response_pe_ctpa == "yes", 1, 0)
+    )
+  
+  # Function to compute the confidence as the proportion of cases with a positive outcome among those that tested positive at a given step
+  compute_confidence <- function(data, indicator) {
+    sub_data <- data %>% filter(indicator == 1)
+    if (nrow(sub_data) == 0) return(NA)
+    return(mean(sub_data$outcome_indicator, na.rm = TRUE))
+  }
+  
+  # Compute diagnostic confidence for each step based on the outcome
+  confidence_eval   <- compute_confidence(resp_dat, resp_dat$eval_indicator)
+  confidence_diag   <- compute_confidence(resp_dat, resp_dat$diag_indicator)
+  confidence_ddimer <- compute_confidence(resp_dat, resp_dat$ddimer_indicator)
+  confidence_ctpa   <- compute_confidence(resp_dat, resp_dat$ctpa_indicator)
+  
+  # Aggregate the confidence values into a data frame
+  avg_conf <- data.frame(
+    step = c("Evaluation", "Diagnosis", "D-dimer", "CTPA"),
+    confidence = c(confidence_eval, confidence_diag, confidence_ddimer, confidence_ctpa)
+  )
+  
+  # Set the factor levels to maintain the desired x-axis order: 
+  # "Evaluation" on the left, progressing through to "CTPA" on the right
+  avg_conf$step <- factor(avg_conf$step, levels = c("Evaluation", "Diagnosis", "D-dimer", "CTPA"))
+  
+  # Create a line plot showing the progression of computed diagnostic confidence across steps
+  p <- ggplot(avg_conf, aes(x = step, y = confidence, group = 1)) +
+    geom_line(color = "blue", size = 1) +
+    geom_point(size = 4, color = "red") +
+    scale_y_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+    labs(title = title,
+         x = "Diagnostic Step",
+         y = "Computed Diagnostic Confidence") +
+    theme_minimal()
+  
+  # Print the plot
+  print(p)
+}
+
+
+## --- External GPL-3 licensed code --- ##
+# From: https://stackoverflow.com/questions/68095243/piedonut-how-to-change-color-of-pie-and-donut, bassed on https://cardiomoon.github.io/webr/index.html (GPL-3!)
+pie_donut_full <-
+  function (data,
+            mapping,
+            start = getOption("PieDonut.start",
+                              0),
+            addPieLabel = TRUE,
+            addDonutLabel = TRUE,
+            showRatioDonut = TRUE,
+            showRatioPie = TRUE,
+            ratioByGroup = TRUE,
+            showRatioThreshold = getOption("PieDonut.showRatioThreshold",
+                                           0.02),
+            labelposition = getOption("PieDonut.labelposition",
+                                      2),
+            labelpositionThreshold = 0.1,
+            r0 = getOption("PieDonut.r0",
+                           0.3),
+            r1 = getOption("PieDonut.r1", 1),
+            r2 = getOption("PieDonut.r2",
+                           1.2),
+            explode = NULL,
+            selected = NULL,
+            explodePos = 0.1,
+            color = "white",
+            pieAlpha = 0.8,
+            donutAlpha = 1,
+            maxx = NULL,
+            showPieName = TRUE,
+            showDonutName = FALSE,
+            title = NULL,
+            pieLabelSize = 4,
+            donutLabelSize = 3,
+            titlesize = 5,
+            explodePie = TRUE,
+            explodeDonut = FALSE,
+            use.label = TRUE,
+            use.labels = TRUE,
+            family = getOption("PieDonut.family", ""),
+            palette_name = "Dark2",
+            round_to_digits = 4)
+  {
+    old_options <- options(OutDec = ".") 
+    on.exit(options(old_options))  
+
+    (cols = colnames(data))
+    if (use.labels)
+      data = moonBook::addLabelDf(data, mapping)
+    count <- NULL
+    if ("count" %in% names(mapping))
+      count <- moonBook::getMapping(mapping, "count")
+    count
+    pies <- donuts <- NULL
+    (pies = moonBook::getMapping(mapping, "pies"))
+    if (is.null(pies))
+      (pies = moonBook::getMapping(mapping, "pie"))
+    if (is.null(pies))
+      (pies = moonBook::getMapping(mapping, "x"))
+    (donuts = moonBook::getMapping(mapping, "donuts"))
+    if (is.null(donuts))
+      (donuts = moonBook::getMapping(mapping, "donut"))
+    if (is.null(donuts))
+      (donuts = moonBook::getMapping(mapping, "y"))
+    if (!is.null(count)) {
+      df <-
+        data %>% group_by(.data[[pies]]) %>% dplyr::summarize(Freq = sum(.data[[count]]))
+      df
+    }
+    else {
+      df = data.frame(table(data[[pies]]))
+    }
+    colnames(df)[1] = pies
+    df$end = cumsum(df$Freq)
+    df$start = dplyr::lag(df$end)
+    df$start[1] = 0
+    total = sum(df$Freq)
+    df$start1 = df$start * 2 * pi / total
+    df$end1 = df$end * 2 * pi / total
+    df$start1 = df$start1 + start
+    df$end1 = df$end1 + start
+    df$focus = 0
+    if (explodePie)
+      df$focus[explode] = explodePos
+    df$mid = (df$start1 + df$end1) / 2
+    df$x = ifelse(df$focus == 0, 0, df$focus * sin(df$mid))
+    df$y = ifelse(df$focus == 0, 0, df$focus * cos(df$mid))
+    df$label = df[[pies]]
+    df$ratio = df$Freq / sum(df$Freq)
+    if (showRatioPie) {
+      df$label = ifelse(
+        df$ratio >= showRatioThreshold,
+        paste0(df$label, "\n(", gsub("\\.", digit_point_char, scales::percent(round(df$ratio, digits=round_to_digits))), ")"),
+        as.character(df$label)
+      )
+    }
+    df$labelx = (r0 + r1) / 2 * sin(df$mid) + df$x
+    df$labely = (r0 + r1) / 2 * cos(df$mid) + df$y
+    if (!is.factor(df[[pies]]))
+      df[[pies]] <- factor(df[[pies]])
+    df
+    mainCol = RColorBrewer::brewer.pal(nrow(df), name = palette_name)
+    df$radius = r1
+    df$radius[df$focus != 0] = df$radius[df$focus != 0] + df$focus[df$focus !=
+                                                                     0]
+    df$hjust = ifelse((df$mid %% (2 * pi)) > pi, 1, 0)
+    df$vjust = ifelse(((df$mid %% (2 * pi)) < (pi / 2)) |
+                        (df$mid %% (2 *
+                                      pi) > (pi * 3 /
+                                               2)), 0, 1)
+    df$segx = df$radius * sin(df$mid)
+    df$segy = df$radius * cos(df$mid)
+    df$segxend = (df$radius + 0.05) * sin(df$mid)
+    df$segyend = (df$radius + 0.05) * cos(df$mid)
+    df
+    if (!is.null(donuts)) {
+      subColor = makeSubColor(mainCol, no = length(unique(data[[donuts]])))
+      subColor
+      data
+      if (!is.null(count)) {
+        df3 <- as.data.frame(data[c(donuts, pies, count)])
+        colnames(df3) = c("donut", "pie", "Freq")
+        df3
+        df3 <- eval(parse(text = "complete(df3,donut,pie)"))
+        df3$Freq[is.na(df3$Freq)] = 0
+        if (!is.factor(df3[[1]]))
+          df3[[1]] = factor(df3[[1]])
+        if (!is.factor(df3[[2]]))
+          df3[[2]] = factor(df3[[2]])
+        df3 <- df3 %>% arrange(.data$pie, .data$donut)
+        a <- df3 %>% spread(.data$pie, value = .data$Freq)
+        a = as.data.frame(a)
+        a
+        rownames(a) = a[[1]]
+        a = a[-1]
+        a
+        colnames(df3)[1:2] = c(donuts, pies)
+      }
+      else {
+        df3 = data.frame(table(data[[donuts]], data[[pies]]),
+                         stringsAsFactors = FALSE)
+        colnames(df3)[1:2] = c(donuts, pies)
+        a = table(data[[donuts]], data[[pies]])
+        a
+      }
+      a
+      df3
+      df3$group = rep(colSums(a), each = nrow(a))
+      df3$pie = rep(1:ncol(a), each = nrow(a))
+      total = sum(df3$Freq)
+      total
+      df3$ratio1 = df3$Freq / df3$group
+      df3
+      if (ratioByGroup) {
+        df3$ratio = gsub("\\.", digit_point_char, scales::percent(round(df3$Freq / df3$group, digits = round_to_digits)))
+      } else {
+        df3$ratio <- gsub("\\.", digit_point_char, scales::percent(round(df3$ratio1, digits = round_to_digits)))
+      }
+      df3$end = cumsum(df3$Freq)
+      df3
+      df3$start = dplyr::lag(df3$end)
+      df3$start[1] = 0
+      df3$start1 = df3$start * 2 * pi / total
+      df3$end1 = df3$end * 2 * pi / total
+      df3$start1 = df3$start1 + start
+      df3$end1 = df3$end1 + start
+      df3$mid = (df3$start1 + df3$end1) / 2
+      df3$focus = 0
+      if (!is.null(selected)) {
+        df3$focus[selected] = explodePos
+      }
+      else if (!is.null(explode)) {
+        selected = c()
+        for (i in 1:length(explode)) {
+          start = 1 + nrow(a) * (explode[i] - 1)
+          selected = c(selected, start:(start + nrow(a) -
+                                          1))
+        }
+        selected
+        df3$focus[selected] = explodePos
+      }
+      df3
+      df3$x = 0
+      df3$y = 0
+      df
+      if (!is.null(explode)) {
+        explode
+        for (i in 1:length(explode)) {
+          xpos = df$focus[explode[i]] * sin(df$mid[explode[i]])
+          ypos = df$focus[explode[i]] * cos(df$mid[explode[i]])
+          df3$x[df3$pie == explode[i]] = xpos
+          df3$y[df3$pie == explode[i]] = ypos
+        }
+      }
+      df3$no = 1:nrow(df3)
+      df3$label = df3[[donuts]]
+      if (showRatioDonut) {
+        if (max(nchar(levels(df3$label))) <= 2)
+          df3$label = paste0(df3$label, "(", df3$ratio,
+                             ")")
+        else
+          df3$label = paste0(df3$label, "\n(", df3$ratio,
+                             ")")
+      }
+      df3$label[df3$ratio1 == 0] = ""
+      df3$label[df3$ratio1 < showRatioThreshold] = ""
+      df3$hjust = ifelse((df3$mid %% (2 * pi)) > pi, 1, 0)
+      df3$vjust = ifelse(((df3$mid %% (2 * pi)) < (pi / 2)) |
+                           (df3$mid %% (2 *
+                                          pi) > (pi * 3 /
+                                                   2)), 0, 1)
+      df3$no = factor(df3$no)
+      df3
+      labelposition
+      if (labelposition > 0) {
+        df3$radius = r2
+        if (explodeDonut)
+          df3$radius[df3$focus != 0] = df3$radius[df3$focus !=
+                                                    0] + df3$focus[df3$focus != 0]
+        df3$segx = df3$radius * sin(df3$mid) + df3$x
+        df3$segy = df3$radius * cos(df3$mid) + df3$y
+        df3$segxend = (df3$radius + 0.05) * sin(df3$mid) +
+          df3$x
+        df3$segyend = (df3$radius + 0.05) * cos(df3$mid) +
+          df3$y
+        if (labelposition == 2)
+          df3$radius = (r1 + r2) / 2
+        df3$labelx = (df3$radius) * sin(df3$mid) + df3$x
+        df3$labely = (df3$radius) * cos(df3$mid) + df3$y
+      }
+      else {
+        df3$radius = (r1 + r2) / 2
+        if (explodeDonut)
+          df3$radius[df3$focus != 0] = df3$radius[df3$focus !=
+                                                    0] + df3$focus[df3$focus != 0]
+        df3$labelx = df3$radius * sin(df3$mid) + df3$x
+        df3$labely = df3$radius * cos(df3$mid) + df3$y
+      }
+      df3$segx[df3$ratio1 == 0] = 0
+      df3$segxend[df3$ratio1 == 0] = 0
+      df3$segy[df3$ratio1 == 0] = 0
+      df3$segyend[df3$ratio1 == 0] = 0
+      if (labelposition == 0) {
+        df3$segx[df3$ratio1 < showRatioThreshold] = 0
+        df3$segxend[df3$ratio1 < showRatioThreshold] = 0
+        df3$segy[df3$ratio1 < showRatioThreshold] = 0
+        df3$segyend[df3$ratio1 < showRatioThreshold] = 0
+      }
+      df3
+      del = which(df3$Freq == 0)
+      del
+      if (length(del) > 0)
+        subColor <- subColor[-del]
+      subColor
+    }
+    p <- ggplot() + ggforce::theme_no_axes() + coord_fixed()
+    if (is.null(maxx)) {
+      r3 = r2 + 0.3
+    }
+    else {
+      r3 = maxx
+    }
+    p1 <- p + ggforce::geom_arc_bar(
+      aes_string(
+        x0 = "x",
+        y0 = "y",
+        r0 = as.character(r0),
+        r = as.character(r1),
+        start = "start1",
+        end = "end1",
+        fill = pies
+      ),
+      alpha = pieAlpha,
+      color = color,
+      data = df
+    ) + transparent() + scale_fill_manual(values = mainCol) +
+      xlim(r3 * c(-1, 1)) + ylim(r3 * c(-1, 1)) + guides(fill = FALSE)
+    if ((labelposition == 1) & (is.null(donuts))) {
+      p1 <- p1 + geom_segment(aes_string(
+        x = "segx",
+        y = "segy",
+        xend = "segxend",
+        yend = "segyend"
+      ),
+      data = df) + geom_text(
+        aes_string(
+          x = "segxend",
+          y = "segyend",
+          label = "label",
+          hjust = "hjust",
+          vjust = "vjust"
+        ),
+        size = pieLabelSize,
+        data = df,
+        family = family
+      )
+    }
+    else if ((labelposition == 2) & (is.null(donuts))) {
+      p1 <- p1 + geom_segment(aes_string(
+        x = "segx",
+        y = "segy",
+        xend = "segxend",
+        yend = "segyend"
+      ),
+      data = df[df$ratio < labelpositionThreshold,]) +
+        geom_text(
+          aes_string(
+            x = "segxend",
+            y = "segyend",
+            label = "label",
+            hjust = "hjust",
+            vjust = "vjust"
+          ),
+          size = pieLabelSize,
+          data = df[df$ratio < labelpositionThreshold,],
+          family = family
+        ) + geom_text(
+          aes_string(x = "labelx",
+                     y = "labely", label = "label"),
+          size = pieLabelSize,
+          data = df[df$ratio >= labelpositionThreshold,],
+          family = family
+        )
+    }
+    else {
+      p1 <- p1 + geom_text(
+        aes_string(x = "labelx", y = "labely",
+                   label = "label"),
+        size = pieLabelSize,
+        data = df,
+        family = family
+      )
+    }
+    if (showPieName)
+      p1 <- p1 + annotate(
+        "text",
+        x = 0,
+        y = 0,
+        label = pies,
+        size = titlesize,
+        family = family
+      )
+    p1 <- p1 + theme(text = element_text(family = family))
+    if (!is.null(donuts)) {
+      if (explodeDonut) {
+        p3 <- p + ggforce::geom_arc_bar(
+          aes_string(
+            x0 = "x",
+            y0 = "y",
+            r0 = as.character(r1),
+            r = as.character(r2),
+            start = "start1",
+            end = "end1",
+            fill = "no",
+            explode = "focus"
+          ),
+          alpha = donutAlpha,
+          color = color,
+          data = df3
+        )
+      }
+      else {
+        p3 <- p + ggforce::geom_arc_bar(
+          aes_string(
+            x0 = "x",
+            y0 = "y",
+            r0 = as.character(r1),
+            r = as.character(r2),
+            start = "start1",
+            end = "end1",
+            fill = "no"
+          ),
+          alpha = donutAlpha,
+          color = color,
+          data = df3
+        )
+      }
+      p3 <-
+        p3 + transparent() + scale_fill_manual(values = subColor) +
+        xlim(r3 * c(-1, 1)) + ylim(r3 * c(-1, 1)) + guides(fill = FALSE)
+      p3
+      if (labelposition == 1) {
+        p3 <- p3 + geom_segment(aes_string(
+          x = "segx",
+          y = "segy",
+          xend = "segxend",
+          yend = "segyend"
+        ),
+        data = df3) + geom_text(
+          aes_string(
+            x = "segxend",
+            y = "segyend",
+            label = "label",
+            hjust = "hjust",
+            vjust = "vjust"
+          ),
+          size = donutLabelSize,
+          data = df3,
+          family = family
+        )
+      }
+      else if (labelposition == 0) {
+        p3 <- p3 + geom_text(
+          aes_string(x = "labelx",
+                     y = "labely", label = "label"),
+          size = donutLabelSize,
+          data = df3,
+          family = family
+        )
+      }
+      else {
+        p3 <- p3 + geom_segment(aes_string(
+          x = "segx",
+          y = "segy",
+          xend = "segxend",
+          yend = "segyend"
+        ),
+        data = df3[df3$ratio1 < labelpositionThreshold,]) + geom_text(
+          aes_string(
+            x = "segxend",
+            y = "segyend",
+            label = "label",
+            hjust = "hjust",
+            vjust = "vjust"
+          ),
+          size = donutLabelSize,
+          data = df3[df3$ratio1 < labelpositionThreshold,],
+          family = family
+        ) + geom_text(
+          aes_string(x = "labelx",
+                     y = "labely", label = "label"),
+          size = donutLabelSize,
+          data = df3[df3$ratio1 >= labelpositionThreshold,],
+          family = family
+        )
+      }
+      if (!is.null(title))
+        p3 <- p3 + annotate(
+          "text",
+          x = 0,
+          y = r3,
+          label = title,
+          size = titlesize,
+          family = family
+        )
+      else if (showDonutName)
+        p3 <- p3 + annotate(
+          "text",
+          x = (-1) * r3,
+          y = r3,
+          label = donuts,
+          hjust = 0,
+          size = titlesize,
+          family = family
+        )
+      p3 <- p3 + theme(text = element_text(family = family))
+      full_pd <- p1 + patchwork::inset_element(
+        p3, left = 0, right = 1, bottom = 0, top = 1)
+      print(full_pd)
+      # grid::grid.newpage()
+      # print(p1, vp = grid::viewport(height = 1, width = 1))
+      # print(p3, vp = grid::viewport(height = 1, width = 1))
+    }
+    else {
+      p1
+    }
+  }
+## --- END of external GPL-3 licensed code --- ##
+
+```
+
+## Import data
+
+Import data and results
+
+```{r}
+# Read patient data
+pat_data = read_csv("data/combined_dataframe.csv")
+
+
+# Read LLM responses including meta data
+llm_results = read_csv("data/validated_responses.csv")
+
+
+# Adjust data format
+llm_results$is_re_run = grepl("_rerun_", llm_results$llm_res_file_path)
+llm_results$model[llm_results$is_re_run] = paste0("rerun_", llm_results$model[llm_results$is_re_run])
+llm_results$validation__actual_bool_llm_response = as.factor(llm_results$validation__actual_bool_llm_response)
+levels(llm_results$validation__actual_bool_llm_response) = c("no", "yes")
+llm_results$validation__correct_bool_llm_response = as.factor(llm_results$validation__correct_bool_llm_response)
+levels(llm_results$validation__correct_bool_llm_response) = c("no", "yes")
+
+
+# Exclude some models
+llm_results = llm_results %>% filter(!grepl("phi3|phi-3|phi 3|tinyllama", model, ignore.case = TRUE))
+
+
+# Check for model runs
+sel_models = table(llm_results$model) %>%
+  as.data.frame() %>%
+  filter(Freq >= 6460) %>%
+  pull(Var1) %>%
+  as.character()
+
+
+# Identify incomplete runs
+target_list <- list(
+  evaluation_for_pe = c(scenario = "evaluation_for_pe"),
+  pe_most_likely_diagnosis = c(scenario = "pe_most_likely_diagnosis"),
+  pe_d_dimer = c(scenario = "pe_d_dimer"),
+  pe_ctpa = c(scenario = "pe_ctpa"),
+  pe_treatment = c(scenario = "pe_treatment")
+)
+num_of_rows = function(i_model){
+  sapply(target_list, function(x, i_model){
+      x=x[["scenario"]]
+      n_rows = llm_results[llm_results$model == i_model & llm_results$llm_scenario == x,] %>% nrow()
+  }, 
+  i_model = i_model)
+}
+model_runs = llm_results %>%
+  pull(model) %>%
+  as.factor() %>%
+  levels() %>%
+  sapply(num_of_rows) %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(model = rownames(.))
+llm_meta_data = llm_results %>%
+    select(model, llm_tokens) %>%
+    filter(!duplicated(model))
+model_runs = model_runs %>%
+  left_join(llm_meta_data, keep = FALSE) %>%
+  mutate(llm_tokens = sapply(llm_tokens, convert_tokens)) %>%
+  mutate(llm_family = get_family(model))
+writexl::write_xlsx(model_runs, "data/model_runs.xlsx")
+complete_model_runs = apply(model_runs[,1:4], 1, function(x) {all(x>0)})
+complete_models = model_runs[complete_model_runs, "model"]
+incomplete_models = model_runs[!complete_model_runs, "model"]
+
+
+# Keep complete runs
+llm_results = llm_results %>% filter(model %in% complete_models)
+
+# Corrections
+llm_results$llm_tokens[grepl("mistral", llm_results$llm_family, ignore.case = T) & llm_results$llm_tokens == "70B"] = "123B"
+
+```
+
+# Results
+
+## Patients
+
+### Tab.1 Patient characteristics
+
+General characteristics of the cohort.
+
+```{r}
+library(dplyr)
+library(compareGroups)
+
+# Define a function to convert numeric columns to factor if they have low cardinality
+convert_to_factor_if_categorical <- function(x, threshold = 50) {
+  if (is.numeric(x) && n_distinct(x) < threshold)
+    return(as.factor(x))
+  else
+    return(x)
+}
+
+# Apply the conversion:
+# 1. For numeric columns, convert those with low cardinality into factors.
+# 2. For columns that are already non-numeric, make sure they are factors.
+pat_data <- pat_data %>%
+  mutate(across(where(is.numeric), ~ convert_to_factor_if_categorical(.))) %>%
+  mutate(across(where(~ !is.numeric(.)), as.factor))
+
+# Define the model formula for table one
+formula_compareGroups <- c("outcome__pulmonary_embolism ~ 
+                             demographic__age +
+                             demographic__sex +
+                             demographic__weight +
+                             demographic__height +
+                             sign__oxygen_saturation +
+                             sign__pulse_frequency +
+                             sign__hemoptysis +
+                             symptom__chest_pain +
+                             symptom__dyspnea +
+                             symptom__syncope +
+                             history__immobilisation_or_surgery +
+                             history__previous_pe_or_dvt +
+                             assessment__pe_most_likely_diagnosis +
+                             outcome__eval_for_pe_required +
+                             outcome__pe_d_dimer_required +
+                             outcome__ctpa_indicated")
+
+# Create and export the comparison table
+pat_data %>%
+  compareGroups(formula = formula_compareGroups, method = 2) %>%
+  createTable(hide.no = c("No", "FALSE", "0")) %>%
+  export2md(header.labels = c(p.overall = "p-value"))
+```
+
+### Fig. S1. Basic Characteristics
+
+```{r}
+# Convert age to numeric
+ad_wide = pat_data %>%
+  mutate(
+    demographic__age = as.numeric(demographic__age),
+    demographic__sex = factor(demographic__sex, levels = c("Male", "Female"))
+  ) %>%
+  filter(demographic__sex != "Unknown") %>%
+  mutate(outcome__pulmonary_embolism = ifelse(outcome__pulmonary_embolism==1, "PE", "non-PE")) %>%
+  mutate(outcome__pulmonary_embolism = as.factor(outcome__pulmonary_embolism))
+
+# Create the density plot with inverted axes and facets for sex at birth
+fig_s1 = ggplot(ad_wide, aes(x = demographic__age, fill = demographic__sex)) +
+  geom_density(data = subset(ad_wide, demographic__sex == "Male"), aes(y = -..density..), bw = 3.5, alpha = 0.7) +
+  geom_density(data = subset(ad_wide, demographic__sex == "Female"), aes(y = ..density..), bw = 3.5, alpha = 0.7) +
+  labs(title = "Age and Sex Distribution",
+       x = "Age at Inclusion",
+       y = "Density",
+       fill = "Sex at Birth",
+       subtitle = paste("Overall n =", nrow(ad_wide))) +
+  theme_minimal() +
+  coord_flip() +
+  scale_y_continuous(labels = abs) +
+  scale_fill_manual(values = c("Male" = "#E69F00", "Female" = "#56B4E9")) + 
+  geom_vline(xintercept=18, linetype='dashed') +
+  facet_wrap("outcome__pulmonary_embolism")
+
+ggsave("figures/fig_s1.jpg", fig_s1, device = "jpg", height = 6, width = 8, dpi = 300, create.dir = TRUE)
+fig_s1
+```
+
+**Fig. S1. Demographic data of the study population.** This figure illustrates the sex and age distribution of all included patients. The density plot shows the age distribution for males and females, with densities plotted on inverted axes for better comparison. The plot includes a dashed vertical line at age 18 to indicate the threshold for adulthood. The data is further faceted by the outcome of pulmonary embolism.
+
+## Model runs
+
+```{r}
+model_runs %>% DT::datatable()
+```
+
+## Responses
+
+## Compute Metrics
+
+```{r}
+target_list = list(
+    evaluation_for_pe=c(scenario="evaluation_for_pe"),
+    pe_ctpa=c(scenario="pe_ctpa"),
+    pe_d_dimer=c(scenario="pe_d_dimer"),
+    pe_most_likely_diagnosis=c(scenario="pe_most_likely_diagnosis")
+)
+
+file.create("data/llm_confusion_matrices.txt")
+llm_results$model = as.factor(as.character(llm_results$model))
+models = levels(llm_results$model)
+perf_df_list = lapply(models, get_model_summary, target_list=target_list, response_data=llm_results)
+perf_df = do.call(rbind, perf_df_list)
+
+get_quality = function(selected_model, llm_results){
+  model_results = llm_results %>% filter(model == selected_model)
+  llm_response_type = model_results$llm_response_type
+  appropriate_reponse = sum(llm_response_type %in% c("ok"))/nrow(model_results)
+  return(appropriate_reponse)
+}
+perf_df$model_scenario = paste(perf_df$model, perf_df$scenario, sep = "_")
+perf_df$llm_response_quality = sapply(perf_df$model, get_quality, llm_results=llm_results)
+perf_df$accuracy[is.na(perf_df$accuracy) | is.nan(perf_df$accuracy)] = 0
+perf_df$accuracy = perf_df$accuracy * perf_df$llm_response_quality
+
+```
+
+
+## Remove very low quality models (<10%)
+```{r}
+dim(perf_df)
+perf_df = perf_df %>% filter(llm_response_quality > .1)
+dim(perf_df)
+dim(llm_results)
+llm_results = llm_results %>% filter(model %in% perf_df < .1)
+dim(llm_results)
+```
+
+
+##  Overall accuracy
+```{r}
+df_acc = perf_df %>% filter(scenario != "pe_treatment") 
+perf_df = perf_df %>%
+  mutate(llm_acc = NA)
+acc_models = levels(as.factor(as.character(df_acc$model)))
+for (i in acc_models){
+    acc_i = mean(df_acc$accuracy[df_acc$model==i], na.rm = TRUE)
+    perf_df$llm_acc[perf_df$model==i] = acc_i
+}
+```
+
+
+## Add meta data
+```{r}
+# Add model meta data
+
+perf_df = perf_df %>%
+  dplyr::mutate(llm_family = get_family(model))
+
+perf_df$llm_tokens = NA
+perf_df$llm_gen_arch = NA
+perf_df$tuning_mode = "base"
+
+
+for (model in models) {
+  # Check if model exists in perf_df
+  if (!(model %in% perf_df$model)) {
+    print(paste("Model", model, "not found in perf_df. Skipping..."))
+    next  # Skip to the next iteration
+  }
+  
+  llm_tokens = llm_results[llm_results$model == model,]$llm_tokens[1]
+  llm_family = llm_results[llm_results$model == model,]$llm_family[1]
+  perf_df[perf_df$model == model,]$llm_tokens = convert_tokens(llm_tokens)
+  llm_gen_arch = llm_results[llm_results$model == model,]$llm_gen_arch[1]
+  perf_df[perf_df$model == model,]$llm_gen_arch = as.character(llm_gen_arch)
+
+
+  if (startsWith(model, "it-") & grepl("fine_tuned", model, ignore.case = TRUE)) {
+    perf_df[perf_df$model == model,]$tuning_mode = "fine- and prompt-tuned"
+  } else if (startsWith(model, "it-")) {
+    perf_df[perf_df$model == model,]$tuning_mode = "prompt-tuned"
+  } else if (grepl("fine_tuned", model, ignore.case = TRUE)) {
+    perf_df[perf_df$model == model,]$tuning_mode = "fine-tuned"
+  }
+}
+
+perf_df$model_base = paste0(perf_df$llm_family, "-", perf_df$llm_tokens, "B")
+perf_df$model_base_scenario = paste0(perf_df$llm_family, "-", perf_df$llm_tokens, "B", "-", perf_df$scenario)
+perf_df$model_base_scenario_tuning_mode = paste0(perf_df$llm_family, "-", perf_df$llm_tokens, "B", "-", perf_df$scenario, "-", perf_df$tuning_mode)
+
+token_num = function(query_model, perf_df){
+  query_model_family = perf_df %>% filter(model == query_model) %>% pull(llm_family)
+  query_llm_tokens = perf_df %>% filter(llm_family == query_model_family) %>% pull(llm_tokens)
+  num_llm_tokens = length(levels(as.factor(as.character(query_llm_tokens))))
+  return(num_llm_tokens)
+}
+perf_df$llm_available_token_sizes = sapply(perf_df$model, token_num, perf_df = perf_df)
+
+perf_df$llm_family = stringr::str_to_upper(perf_df$llm_family)
+
+perf_df$family_and_size = paste0(perf_df$llm_family, "-",perf_df$ llm_tokens, "B")
+
+re_run_model_names = levels(as.factor(as.character(filter(llm_results, is_re_run == TRUE)$model)))
+perf_df$has_re_run = perf_df$model %in% sub("^rerun_", "", re_run_model_names)
+perf_df$is_re_run = perf_df$model %in% re_run_model_names
+
+
+
+pt_models = perf_df %>%
+    filter(tuning_mode %in% c("prompt-tuned")) %>% filter(!duplicated(model_base)) %>%
+    pull(model_base)
+perf_df$has_prompt_tuned_model = perf_df$model_base %in% pt_models
+
+ft_models = perf_df %>%
+    filter(tuning_mode %in% c("fine-tuned")) %>% filter(!duplicated(model_base)) %>%
+    pull(model_base)
+perf_df$has_fine_tuned_model = perf_df$model_base %in% ft_models
+
+perf_df_all = perf_df
+perf_df = perf_df %>%
+    filter(is_re_run == FALSE) %>%
+    arrange(desc(has_re_run)) %>%
+    filter(!duplicated(model_base_scenario_tuning_mode))
+
+perf_df = perf_df %>% mutate(tuning_mode = factor(
+      tuning_mode,
+      levels = c(
+        "base",
+        "prompt-tuned",
+        "fine-tuned",
+        "fine- and prompt-tuned"
+      )
+    )
+  ) 
+```
+
+
+
+## Re-runs
+```{r}
+get_response_overlap = function(perf_df, llm_results) {
+  # Build primary and re-run datasets with the computed `model_scenario_case`
+  primary = llm_results %>%
+    filter(!is_re_run) %>%
+    mutate(
+      model_scenario_case = paste0(model, "_", llm_scenario, "_", case_id),
+      model_scenario = paste0(model, "_", llm_scenario)
+    ) %>%
+    filter(!duplicated(model_scenario_case))
+  
+  rerun = llm_results %>%
+    filter(is_re_run) %>%
+    mutate(
+      model_scenario_case = sub("^rerun_", "", paste0(model, "_", llm_scenario, "_", case_id)),
+      model_scenario = sub("^rerun_", "", paste0(model, "_", llm_scenario))
+    )
+  
+  # Join the datasets on `model_scenario_case` and compute the overlap metrics
+  overlap = left_join(primary, rerun, by = "model_scenario_case", 
+                        suffix = c("_primary", "_rerun")) %>%
+    mutate(
+      identical_responses = llm_response_primary == llm_response_rerun,
+      equivalent_responses = llm_response_cleaned_primary == llm_response_cleaned_rerun
+    ) %>%
+    # Rename the primary's model_scenario column to "model_scenario"
+    select(model_scenario = model_scenario_primary, 
+           model = model_primary, 
+           identical_responses, 
+           equivalent_responses)
+  
+  # Compute overlap per model and scenario
+  re_responses = sapply(
+    perf_df$model_scenario,
+    function(x, overlap) {
+      identical_response = overlap %>% 
+        filter(model_scenario == x) %>%
+        pull("identical_responses") %>%
+        mean(na.rm = TRUE)
+      equivalent_response = overlap %>% 
+        filter(model_scenario == x) %>%
+        pull("equivalent_responses") %>%
+        mean(na.rm = TRUE)
+      c(identical_response = identical_response,
+        equivalent_response = equivalent_response)
+    },
+    overlap = overlap
+  )
+  
+  return(re_responses)
+}
+
+
+response_overlap = get_response_overlap(perf_df, llm_results) %>%
+  t() %>% as_tibble(rownames = "model_scenario")
+
+
+perf_df = perf_df %>% left_join(response_overlap, by = c("model_scenario" = "model_scenario"))
+
+```
+
+## Compute agentic performance
+
+To evaluate the system performance, the responses have to be evaluated in their logical context.
+
+```{r}
+
+# Define the order of evaluation
+ordered_target_df = data.frame(
+    scenario = c("evaluation_for_pe", "pe_d_dimer", "pe_ctpa"),
+    col = c("outcome__eval_for_pe_required",
+            "outcome__pe_d_dimer_required",
+            "outcome__pulmonary_embolism")
+)
+
+# Function for computing cumulative/agentic performance for each model
+get_agentic_perfomance = function(query_model,
+                                  ordered_target_df,
+                                  llm_results,
+                                  pos_lvl="yes", # if positive, next step will be addressed
+                                  neg_lvl="no" # if negative, the chain of thought ends
+                                  ){
+  
+  # skip, if model does not have expected responses
+  num_of_rows = sapply(ordered_target_df[["scenario"]], function(x){
+      n_rows = llm_results %>% filter(model == query_model, llm_scenario == x) %>% nrow()
+    })
+  
+  if(any(num_of_rows == 0)){
+    paste0("The following scenarios of ",
+        query_model, " are empty:", paste(print(names(num_of_rows)[num_of_rows == 0])))
+  }
+  
+  if(all(num_of_rows == 0)){
+    return(NA)
+  }
+
+  # Get responses per model into a meaningful wide format
+  for (i in 1:nrow(ordered_target_df)){
+      i_scenario = ordered_target_df[i,]$scenario
+      i_response_column = ordered_target_df[i,]$col
+      i_expected_response = llm_results %>%
+          filter(model == query_model & llm_scenario == i_scenario) %>%
+          select(all_of(c("llm_scenario", "validation__correct_bool_llm_response")))
+      colnames(i_expected_response) = c("llm_scenario", i_response_column)
+      i_llm_response = llm_results %>%
+          filter(model == query_model & llm_scenario == i_scenario) %>%
+          select(all_of(c("llm_scenario", "validation__actual_bool_llm_response")))
+      colnames(i_llm_response) = c("llm_scenario", i_response_column)
+      i_is_valid = llm_results %>%
+          filter(model == query_model & llm_scenario == i_scenario) %>%
+          select(all_of(c("llm_scenario", "is_valid")))
+      colnames(i_is_valid) = c("llm_scenario", i_response_column)
+
+      if (i == 1) {
+          expected_responses = i_expected_response
+          cumulative_responses = i_llm_response
+          cumulative_correct_responses = i_is_valid
+      } else {
+          if (nrow(expected_responses) != nrow(i_expected_response)){
+            #print(paste0("Returing NULL for model: ", query_model))
+            return(NULL)
+          }
+          if (nrow(cumulative_responses) != nrow(i_llm_response)){
+            #print(paste0("Returing NULL for model: ", query_model))
+            return(NULL)
+          }
+          if (nrow(cumulative_correct_responses) != nrow(i_is_valid)){
+            #print(paste0("Returing NULL for model: ", query_model))
+            return(NULL)
+            }
+          expected_responses = cbind(expected_responses, i_expected_response)
+          cumulative_responses = cbind(cumulative_responses, i_llm_response)
+          cumulative_correct_responses = cbind(cumulative_correct_responses, i_is_valid)
+      }
+  }
+  
+  # Keep only relevant columns
+  expected_responses = expected_responses[,-(which(colnames(expected_responses) == "llm_scenario"))]
+  cumulative_correct_responses = cumulative_correct_responses[,-(which(colnames(cumulative_correct_responses) == "llm_scenario"))]
+  cumulative_responses = cumulative_responses[,-(which(colnames(cumulative_responses) == "llm_scenario"))]
+  
+  
+  # Get the first negative answer (after which the line of thought is discontinued)
+  first_no = apply(cumulative_responses, 1, function(x){
+    if (all(is.na(x))) {
+      return(NA)
+    }
+    has_no = any(x == neg_lvl, na.rm = TRUE)
+    if (!has_no) {
+      first_no = -1
+    } else {
+      first_no = min(which(x == neg_lvl))
+    }
+    first_no
+  })
+  
+  # Set to neg_lvl the tests once the line of thought is terminated
+  cumulative_responses_list = sapply(1:(length(first_no)), function(i){
+      responses = cumulative_responses[i,]
+      if (!is.na(first_no[i]) && first_no[i] != -1) {
+          responses[-(1:first_no[i])] = neg_lvl
+      }
+      responses
+  }, simplify = FALSE)
+  
+  # Convert the list to a matrix
+  conditional_cumulative_responses = do.call(rbind, cumulative_responses_list)
+  
+  # Calculate step-wise performance markers
+  compute_step_wise_performance = function(i){
+      response_data = data.frame(cumulative_responses = factor(conditional_cumulative_responses[,i],
+                                                               levels = c("no", "yes")),
+                                 expected_responses = factor(expected_responses[,i],
+                                                             levels = c("no", "yes")))
+      cf_mtx = table(response_data)
+      perf = get_perf(cf_mtx, 0.1)
+      return(perf)
+  }
+  idx = 1:ncol(conditional_cumulative_responses)
+  names(idx) = colnames(conditional_cumulative_responses)
+  step_wise_perf_df = as.data.frame(t(sapply(idx, compute_step_wise_performance)))
+  colnames(step_wise_perf_df) = paste0("stepwise_", colnames(step_wise_perf_df))
+  step_wise_perf_df$model_scenario = paste(query_model, ordered_target_df$scenario, sep = "_")
+  return(step_wise_perf_df)
+}
+
+models = perf_df %>% filter(!is_re_run) %>% filter(!duplicated(model)) %>% pull(model) %>% as.character()
+perf_df_step_wise_list = sapply(models,
+                           get_agentic_perfomance,
+                           ordered_target_df = ordered_target_df,
+                           llm_results = llm_results,
+                           simplify = FALSE)
+perf_df_step_wise = do.call(rbind, perf_df_step_wise_list)
+perf_df = perf_df %>% left_join(perf_df_step_wise, by = c("model_scenario"="model_scenario"))
+perf_df_all = perf_df_all %>% left_join(perf_df_step_wise, by = c("model_scenario"="model_scenario"))
+perf_df$family_size_and_tuning_mode = paste(perf_df$family_and_size, perf_df$tuning_mode, sep = "-")
+
+# Compute difference between number of LLM indicated CTPAs/VQs and MD indicated CTPA/VQs
+n_ctpa_indicated = sum(pat_data$outcome__ctpa_indicated == "1")
+perf_df$n_ctpa_indicated_by_llm <- perf_df$stepwise_TP + perf_df$stepwise_FP
+perf_df$ctpa_diff_llm_minus_human <- perf_df$n_ctpa_indicated_by_llm - n_ctpa_indicated
+perf_df$ctpa_diff_llm_minus_human_se <- sqrt(perf_df$n_ctpa_indicated_by_llm + n_ctpa_indicated)
+perf_df$ctpa_diff_llm_minus_human_lower_ci <- perf_df$ctpa_diff_llm_minus_human - 1.96 * perf_df$ctpa_diff_llm_minus_human_se
+perf_df$ctpa_diff_llm_minus_human_upper_ci <- perf_df$ctpa_diff_llm_minus_human + 1.96 * perf_df$ctpa_diff_llm_minus_human_se
+to_set_na <- !(perf_df$scenario == "pe_ctpa")
+perf_df$ctpa_diff_llm_minus_human[to_set_na] <- NA
+perf_df$ctpa_diff_llm_minus_human_lower_ci[to_set_na] <- NA
+perf_df$ctpa_diff_llm_minus_human_upper_ci[to_set_na] <- NA
+```
+
+### Tab.S1: Perfomance Data
+
+```{r}
+perf_data_to_write = perf_df %>% mutate(model = paste(family_and_size, tuning_mode, sep = "-"))
+readr::write_csv(perf_data_to_write, "results/llm_performance_data.csv")
+writexl::write_xlsx(perf_data_to_write, "results/table_s1.xlsx")
+
+DT::datatable(perf_data_to_write, 
+          options = list(pageLength = 50,
+                        scrollX = TRUE,
+                        scrollY = "400px"))
+
+# Write the data to CSV and Excel
+if (!dir.exists("results")) {
+  dir.create("results")
+}
+
+```
+
+## Overal accuracy
+
+### Fig.2A. Accuracy by Model
+
+```{r fig.height=8, fig.width=8}
+# Create the bar plot with overall accuracy for each model, sorted by accuracy
+
+base_models = perf_df %>%
+  filter(tuning_mode %in% c("base"))
+
+model_df = sapply(levels(as.factor(base_models$family_size_and_tuning_mode)), function(x){
+  llm_acc = base_models %>% filter(family_size_and_tuning_mode == x) %>% pull(llm_acc) %>% mean(na.rm = TRUE)
+  llm_family = base_models %>% filter(family_size_and_tuning_mode == x) %>% pull(llm_family) %>% as.character() %>% first()
+  return(c(llm_acc=llm_acc, llm_family=llm_family))
+}) 
+model_df=as.data.frame(t(model_df))
+model_df$llm_name = rownames(model_df)
+model_df$llm_acc = as.numeric(model_df$llm_acc)
+
+model_df = model_df %>%
+  filter(!is.na(llm_acc) & !is.nan(llm_acc)) %>%
+  arrange(llm_acc) %>%
+  mutate(llm_family = as.factor(llm_family)) %>%
+  mutate(llm_name = sub("-base$", "", llm_name))
+
+fig2_a = ggplot(model_df, aes(y = llm_acc, x = reorder(llm_name, llm_acc), fill = llm_family)) +
+  geom_bar(stat = "identity") +
+  scale_fill_viridis_d(option = "plasma") +
+  ylab("Overall Accuracy [ratio]") +
+  xlab("Base Model") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 10), legend.position = "top") +
+  labs(fill = "Model Family") +
+  coord_flip()
+
+print(fig2_a)
+```
+
+**Fig. 2A. Overall accuracy of included models** The figure shows accuracy of all included models sorted from highest to lowest. It averages the accuracy of each model over the different decision scenarios.
+
+## Model Size & Accuracy
+
+### Fig.2B. Size & Performance
+
+```{r fig.height=6, fig.width=14}
+plot_df = perf_df %>% 
+     filter(tuning_mode %in% c("base")) %>%
+     filter(llm_available_token_sizes > 2)
+
+fig2_b = ggscatter(
+  perf_df %>% 
+    filter(tuning_mode=="base", llm_available_token_sizes>2),
+  x = "llm_tokens", y = "accuracy",
+  color = "llm_family", shape = "tuning_mode",
+  palette = "npj", size = 3.5,
+  xlab = "Parameters [billion]", 
+  ylab = "Accuracy [ratio]"
+) +
+  labs(color = "LLM family", shape = "Tuning mode") +
+  theme_minimal(base_size = 15) +
+  facet_wrap(~llm_family, scales = "free", nrow = 2) +
+  theme(legend.position = "none") +
+  stat_cor(
+    aes(
+      label = after_stat(
+        paste0(
+          "italic(R)~`=`~\"",
+          gsub("\\.", digit_point_char, signif(..r.., 2)),
+          "\""
+        )
+      )
+    ),
+    method    = "spearman",
+    alternative = "greater",
+    size      = 5,
+    hjust     = -0.1,
+    parse     = TRUE
+  )
+
+print(fig2_b)
+```
+
+**Fig. 2B. Overall accuracy and model size (number of parameters).** The figure shows accuracy over model size in number of parameters separated by model family. Base models with at least three available model sizes (number of parameters) were included. Correlation coefficient R was computed using the Spearman method.
+
+## Tuning & Accuracy
+
+### Fig. 2C. Prompt-Tuning
+
+```{r fig.height=7, fig.width=22}
+# Filter and prepare the data for plotting
+
+plot_df = perf_df %>%
+    group_by(model_base) %>%
+    filter(has_prompt_tuned_model) %>%
+    filter(tuning_mode %in% c("base", "prompt-tuned")) %>%
+    mutate(tuning_mode = factor(tuning_mode, levels = c("base", "prompt-tuned"))) %>% 
+    filter(!duplicated(model_base_scenario_tuning_mode))
+
+
+# Create the violin plot with paired comparison
+fig2_c = ggplot(plot_df, aes(x = tuning_mode, y = accuracy)) +
+  geom_violin(alpha = 0.5, aes(fill = tuning_mode)) +
+  geom_boxplot(width = 0.1, fill = "white") +
+  geom_point(color="gray20") +
+  geom_line(aes(group = model_base_scenario), linetype = "dotted", color="gray50") +
+  labs(x = "Tuning Mode", y = "Accuracy [ratio]") +
+  ylim(NA, 1.05) +
+  theme_minimal(base_size = 15) +
+  theme(legend.position = "none") +
+  stat_compare_means(method = "wilcox.test",
+                     label = "p.format",
+                     ref.group = "base",
+                     paired = TRUE, 
+                     size = 6, vjust = 1.2) +
+  facet_wrap("llm_family", nrow=2)
+
+print(fig2_c)
+```
+
+**Fig. 2C**: This figure shows the accuracy of models in two different tuning modes: "base" and "prompt-tuned". The violin plots illustrate the distribution of accuracy values for each tuning mode, while the box plots show the median values and interquartile ranges. The paired points and dotted lines indicate the accuracy values for each model in both tuning modes. A Wilcoxon test is used to assess the statistical significance of the differences between the two tuning modes. The figure is divided by different LLM families (Large Language Models).
+
+### Fig. 2
+
+```{r fig.height=16, fig.width=22}
+upper_lane = ggarrange(
+  fig2_a, fig2_b, 
+  nrow = 1,
+  labels = c("A", "B"),
+  widths = c(.4, .6)
+)
+
+fig2 = ggarrange(
+  upper_lane, fig2_c,
+  ncol = 1,
+  labels = c("", "C"),
+  heights = c(.6, .4)
+)
+
+ggsave("figures/fig2.jpg", fig2, device = "jpg", height = 16, width = 22, dpi = 300, create.dir = TRUE)
+print(fig2)
+```
+
+**Fig. 2. Overall accuracy of included base models and prompt-tuning** (A) Overall accuracy of all included models sorted from highest to lowest. It averages the accuracy of each model over the different decision scenarios. (B) Accuracy over model size in parameters separated by model family. Base models with at least three available model sizes (number of parameters) were included. Correlation coefficient R was computed using the Spearman method. (C) Accuracy of models by model family in two different tuning modes: "base" and "prompt-tuned". The violin plots illustrate the distribution of accuracy values for each tuning mode, while the box plots show the median values and interquartile ranges. The paired points and dotted lines indicate the accuracy values for each model in both tuning modes. A two-sided Wilcoxon signed-rank test was used to assess the statistical significance of the differences between the two tuning modes.
+
+
+### Fig. S7. Overall Diagnostic Accuracy by Model (all included models)
+
+```{r fig.height=32, fig.width=12}
+# Create the bar plot with overall accuracy for each model, sorted by accuracy
+
+all_models = perf_df
+
+model_df = sapply(levels(as.factor(all_models$family_size_and_tuning_mode)), function(x){
+  llm_acc = all_models %>% filter(family_size_and_tuning_mode == x) %>% pull(llm_acc) %>% mean(na.rm = TRUE)
+  llm_family = all_models %>% filter(family_size_and_tuning_mode == x) %>% pull(llm_family) %>% as.character() %>% first()
+  return(c(llm_acc=llm_acc, llm_family=llm_family))
+}) 
+model_df=as.data.frame(t(model_df))
+model_df$llm_name = rownames(model_df)
+model_df$llm_acc = as.numeric(model_df$llm_acc)
+
+model_df = model_df %>%
+  filter(!is.na(llm_acc) & !is.nan(llm_acc)) %>%
+  arrange(llm_acc) %>%
+  mutate(llm_family = as.factor(llm_family)) %>%
+  mutate(llm_name = sub("-base$", "", llm_name))
+
+fig_s7 = ggplot(model_df, aes(y = llm_acc, x = reorder(llm_name, llm_acc), fill = llm_family)) +
+  geom_bar(stat = "identity") +
+  scale_fill_viridis_d(option = "plasma") +
+  ylab("Overall Accuracy [ratio]") +
+  xlab("Base Model") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 10), legend.position = "top") +
+  labs(fill = "Model Family") +
+  coord_flip()
+
+ggsave("figures/fig_s7.jpg", fig_s7, device = "jpg", height = 32, width = 12, dpi = 300, create.dir = TRUE)
+print(fig_s7)
+```
+
+**Fig. S7. Overall accuracy of all included models and prompt-tuning** (A) Overall accuracy of all included models sorted from highest to lowest.
+
+
+
+### Fig. 3A. Fine-Tuning
+
+```{r fig.height=7, fig.width=16}
+# Filter and prepare the data for plotting
+plot_df = perf_df %>% 
+     filter(has_fine_tuned_model) %>%
+     filter(tuning_mode %in% c("fine-tuned", "base", "prompt-tuned", "fine- and prompt-tuned")) %>%
+     mutate(tuning_mode = factor(tuning_mode, levels = c("base", "prompt-tuned", "fine-tuned", "fine- and prompt-tuned")))
+
+
+# Create the violin plot with paired comparison
+fig3_a = ggplot(plot_df, aes(x = tuning_mode, y = accuracy)) +
+  geom_violin(alpha = 0.5, aes(fill = tuning_mode)) +
+  geom_boxplot(width = 0.1, fill = "white") +
+  geom_point(color="gray20") +
+  geom_line(aes(group = model_base_scenario), linetype = "dotted", color="gray50") +
+  labs(x = "Tuning Mode", y = "Accuracy [ratio]") +
+  theme_minimal(base_size = 15) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 35, hjust = 1)) +
+  stat_compare_means(method = "wilcox.test",
+                     label = "p.format",
+                     ref.group = "base",
+                     angle = 20,
+                     paired = TRUE,
+                     label.y = 1) +
+  ylim(c(0,1.1)) +
+  facet_wrap("llm_family", nrow = 1)
+
+print(fig3_a)
+```
+
+**Fig. 3A**: This figure shows the accuracy of models in four different tuning modes: "base", "prompt-tuned", "fine-tuned", and "fine- and prompt-tuned". The violin plots illustrate the distribution of accuracy values for each tuning mode, while the box plots show the median values and interquartile ranges. The paired points and dotted lines indicate the accuracy values for each model in the different tuning modes. A Wilcoxon test is used to assess the statistical significance of the differences between the tuning modes. The figure is divided by different LLM families (Large Language Models).
+
+### Fig. 3B. Response Reproducibility
+
+```{r fig.height=7, fig.width=16}
+# Filter and prepare the data for plotting
+plot_re_run_models = perf_df %>% filter(has_re_run) %>% pull(model_base)
+
+plot_df = perf_df %>% 
+     filter(model_base %in% plot_re_run_models) %>%
+     filter(has_fine_tuned_model) %>%
+     mutate(tuning_mode = factor(tuning_mode, levels = c("base", "prompt-tuned", "fine-tuned", "fine- and prompt-tuned")))
+
+# Pivot the data to longer format
+plot_df_long = plot_df %>% filter(has_re_run & has_fine_tuned_model) %>%
+  pivot_longer(cols = c(equivalent_response, identical_response),
+               names_to = "response_type",
+               values_to = "response_rate") %>%
+  mutate(response_type = toupper(gsub("_", " ", response_type))) %>%
+  mutate(response_rate = ifelse(is.na(response_rate) | is.nan(response_rate), 0, response_rate))
+
+# Create the combined violin plot with paired comparison
+fig3_b = ggplot(plot_df_long, aes(x = tuning_mode, y = response_rate)) +
+  geom_violin(alpha = 0.5, aes(fill = tuning_mode)) +
+  geom_boxplot(width = 0.1, fill = "white") +
+  geom_point(color="gray20") +
+  geom_line(aes(group = model_base_scenario), linetype = "dotted", color="gray50") +
+  labs(x = "Tuning Mode", y = "Response Overlap [ratio]") +
+  theme_minimal(base_size = 15) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 35, hjust = 1)) +
+  stat_compare_means(method = "wilcox.test",
+                     paired = TRUE,
+                     label = "p.format",
+                     ref.group = "base",
+                     angle = 20,
+                     label.y = 1.05) +
+  ylim(c(0,1.15)) +
+  facet_grid(response_type ~ llm_family, scales = "free_y")
+
+print(fig3_b)
+```
+
+**Fig. 3B**: This figure shows the response reproducibility of models in four different tuning modes: "base", "prompt-tuned", "fine-tuned", and "fine- and prompt-tuned". The violin plots illustrate the distribution of response overlap ratios for each tuning mode, while the box plots show the median values and interquartile ranges. The paired points and dotted lines indicate the response overlap ratios for each model in the different tuning modes. The data is divided into two response types: "EQUIVALENT RESPONSE" and "IDENTICAL RESPONSE". A Wilcoxon test is used to assess the statistical significance of the differences between the tuning modes. The figure is divided by different LLM families (Large Language Models) and response types.
+
+## Reproducibility & Quality
+
+### Fig. S2. Response Quality
+
+```{r fig.height=5, fig.width=9}
+# Filter and prepare the data for plotting
+tuned_models = perf_df %>% filter(tuning_mode %in% c("fine-tuned")) %>% pull(model_base)
+
+plot_df = perf_df %>% 
+     filter(model_base %in% tuned_models) %>%
+     filter(tuning_mode %in% c("fine-tuned", "base", "prompt-tuned", "fine- and prompt-tuned")) %>%
+     mutate(tuning_mode = factor(tuning_mode, levels = c("base", "prompt-tuned", "fine-tuned", "fine- and prompt-tuned"))) %>% mutate(model_base = as.factor(model_base))%>% filter(llm_family != "PHI3.5")
+
+# Calculate medians
+median_df = plot_df %>%
+  group_by(tuning_mode, llm_family) %>%
+  summarise(median_quality = median(llm_response_quality, na.rm = TRUE))
+
+# Add the plot
+fig_s2 = ggplot(plot_df, aes(x = tuning_mode, y = llm_response_quality )) +
+  geom_violin(alpha = 0.5) +
+  geom_boxplot(width = 0.1, fill = "white") +
+  geom_point(aes(color = llm_family, size = llm_tokens)) +  # Add llm_tokens size
+  #geom_text_repel(aes(label = llm_tokens), size = 4) +  # Add repel text labels
+  geom_line(data = median_df, aes(x = tuning_mode, y = median_quality, group = llm_family, color = llm_family), size = 1) +
+  labs(x = "Tuning Mode", y = "Response Quality", size = "Parameters [billion]", color = "Family") +
+  theme_minimal() +
+  stat_compare_means(method = "wilcox.test",
+                     label = "p.format",
+                     ref.group = "base",
+                     paired = TRUE,
+                     label.y = 1.05) # + facet_wrap("llm_family")
+ggsave("figures/fig_s2.jpg", fig_s2, device = "jpg", height = 5, width = 9, dpi = 300, create.dir = TRUE)
+print(fig_s2)
+```
+
+**Fig. S2**: This figure shows the response quality of models in four different tuning modes: "base", "prompt-tuned", "fine-tuned", and "fine- and prompt-tuned". The violin plots illustrate the distribution of response quality values for each tuning mode, while the box plots show the median values and interquartile ranges. The paired points and lines indicate the response quality values for each model in the different tuning modes, colored by LLM family. A Wilcoxon test is used to assess the statistical significance of the differences between the tuning modes, with an alternative hypothesis that the response quality is greater in the tuned models compared to the base model.
+
+### Fig. 3C. number of parameters and ERR/IRR
+
+```{r fig.height=6, fig.width=16}
+plot_df_long_2 = plot_df_long %>% filter(has_re_run == TRUE & has_fine_tuned_model) # %>% filter(tuning_mode == "base") 
+
+fig3_c = ggscatter(
+  plot_df_long_2,
+  x = "llm_tokens", y = "response_rate",
+  color   = "llm_family",
+  shape   = "tuning_mode",
+  size    = 3,
+  palette = "npj",
+  xlab    = "Parameters [billion]",
+  ylab    = "Matching responses [ratio]"
+) +
+  labs(color = "LLM family", shape = "Tuning mode") +
+  theme_minimal(base_size = 15) +
+  facet_grid(response_type ~ llm_family, scales = "free_x") +
+
+  stat_cor(
+    aes(
+      label = after_stat(
+        paste0(
+          "italic(R)~`=`~\"",
+          gsub("\\.", digit_point_char, signif(..r.., 2)),
+          "\""
+        )
+      )
+    ),
+    method       = "spearman",
+    size         = 5,
+    hjust        = -0.1,
+    vjust        = 10,
+    parse        = TRUE
+  )
+
+print(fig3_c)
+```
+
+**Fig. 3C**: This figure shows the correlation between the number of parameters processed by the LLM (Large Language Model) and the response overlap ratio. The scatter plot includes points colored by LLM family and shaped by tuning mode. Spearman's correlation coefficient is calculated and displayed on the plot. The x-axis represents the number of parameters processed by the LLM (in billions), and the y-axis represents the response overlap ratio. The plot is divided into facets by LLM family and response type, allowing for a detailed comparison across different models and tuning modes.
+
+### Fig. 3
+
+```{r fig.height=18, fig.width=21}
+fig3 = ggarrange(
+  fig3_a, fig3_b, fig3_c,
+  ncol = 1,
+  labels = c("A", "B", "C"),
+  heights = c(.3, .4, .3)
+)
+ggsave("figures/fig3.jpg", fig3, device = "jpg", height = 18, width = 21, dpi = 300, create.dir = TRUE)
+print(fig3)
+```
+
+**Fig. 3. Overall Accuracy, Reproducibility, and Fine-Tuning.** (A) Accuracy of models in four different tuning modes: "base", "prompt-tuned", "fine-tuned", and "fine- and prompt-tuned". The violin plots illustrate the distribution of accuracy values for each tuning mode, while the box plots show the median values and interquartile ranges. The paired points and dotted lines indicate the accuracy values for each model in the different tuning modes. A Wilcoxon test is used to assess the statistical significance of the differences between the tuning modes. The figure is divided by different LLM families (Large Language Models). (B) Response reproducibility of models in four different tuning modes: "base", "prompt-tuned", "fine-tuned", and "fine- and prompt-tuned". The violin plots illustrate the distribution of response overlap ratios for each tuning mode, while the box plots show the median values and interquartile ranges. The paired points and dotted lines indicate the response overlap ratios for each model in the different tuning modes. The data is divided into two response types: "EQUIVALENT RESPONSE" and "IDENTICAL RESPONSE". A Wilcoxon test is used to assess the statistical significance of the differences between the tuning modes. The figure is divided by different LLM families (Large Language Models) and response types. (C) This figure shows the correlation between the LLM's model size (number of parameters) and the response overlap ratio. The scatter plot includes points colored by LLM family and shaped by tuning mode. Spearman's correlation coefficient is calculated and displayed on the plot. The x-axis represents the number of parameters processed by the LLM (in billions), and the y-axis represents the response overlap ratio. The plot is divided into facets by LLM family and response type, allowing for a detailed comparison across different models and tuning modes.
+
+## Medical Testing Metrics
+
+### Fig. S4. All Spec. & Sens.
+
+```{r fig.height=20, fig.width=20}
+# Filter and prepare the data for plotting
+tuned_models = perf_df %>%
+#  filter(tuning_mode %in% c("fine-tuned")) %>%
+  pull(model_base)
+
+plot_df = perf_df %>% 
+     filter(model_base %in% tuned_models) %>%
+     filter(tuning_mode %in% c("fine-tuned", "base", "prompt-tuned", "fine- and prompt-tuned")) %>%
+     mutate(tuning_mode = factor(tuning_mode, levels = c("base", "prompt-tuned", "fine-tuned", "fine- and prompt-tuned"))) %>%
+     filter(scenario == "pe_ctpa")
+
+fig_s4 = ggscatter(
+              plot_df,
+              x = "sensitivity",
+              y = "specificity",
+              label = "family_and_size",
+              repel = TRUE,
+              color = "llm_family",
+              shape = "tuning_mode",
+              palette = "npj",
+              xlab = "Sensitivity [ratio]",
+              ylab = "Specificity [ratio]"
+            ) +
+  labs(
+    shape = "Tuning mode",
+    color = "LLM family"
+  ) +
+  theme_minimal(base_size = 15)
+
+ggsave("figures/fig_s4.jpg", fig_s4, device = "jpg", height = 15, width = 15, dpi = 300, create.dir = TRUE)
+
+print(fig_s4)
+```
+
+**Fig. S3**: This figure shows the relationship between sensitivity and specificity for models in four different tuning modes: "base", "prompt-tuned", "fine-tuned", and "fine- and prompt-tuned". The scatter plot includes points colored by LLM family and shaped by tuning mode. The x-axis represents the sensitivity ratio, and the y-axis represents the specificity ratio. The plot is faceted by scenario, allowing for a detailed comparison across different models and tuning modes. Spearman's correlation method is used to assess the relationship between sensitivity and specificity.
+
+### Fig. 4A. Spec. & Sens.
+
+```{r fig.height=9, fig.width=12}
+# Filter and prepare the data for plotting
+tuned_models <- perf_df %>%
+  filter(has_fine_tuned_model) %>%
+  pull(model_base)
+
+plot_df <- perf_df %>%
+  filter(sensitivity > 0.5 & specificity > 0.5) %>% 
+  filter(model_base %in% tuned_models) %>%
+  filter(tuning_mode %in% c("fine-tuned", "base", "prompt-tuned", "fine- and prompt-tuned")) %>%
+  mutate(tuning_mode = factor(tuning_mode,
+                              levels = c("base", "prompt-tuned", "fine-tuned", "fine- and prompt-tuned"))) %>%
+  filter(scenario == "pe_ctpa")
+
+
+fig4_a = ggscatter(
+              plot_df,
+              x = "sensitivity",
+              y = "specificity",
+              label = "family_and_size",
+              repel = TRUE,
+              color = "llm_family",
+              size = 3,
+              shape = "tuning_mode",
+              palette = "npj",
+              xlab = "Sensitivity [ratio]",
+              ylab = "Specificity [ratio]",
+              xlim = c(0.5, 1),
+              ylim = c(0.5, NA)
+            ) +
+  labs(
+    shape = "Tuning mode",
+    color = "LLM family"
+  ) +
+  theme_minimal(base_size = 15)
+
+print(fig4_a)
+```
+
+**Fig. 5A**: This figure shows the relationship between sensitivity and specificity for models in four different tuning modes: "base", "prompt-tuned", "fine-tuned", and "fine- and prompt-tuned". The scatter plot includes points colored by LLM family and shaped by tuning mode. The x-axis represents the sensitivity ratio, and the y-axis represents the specificity ratio. The plot is limited to sensitivity and specificity values between 0.5 and 1. Spearman's correlation method is used to assess the relationship between sensitivity and specificity.
+
+## Balanced Accuracy
+
+### Fig.S-X. Balanced Accuracy by Model
+
+```{r fig.height=10, fig.width=20}
+# Create the bar plot with overall accuracy for each model, sorted by accuracy
+
+base_models = perf_df 
+model_df = sapply(levels(as.factor(base_models$family_size_and_tuning_mode)), function(x){
+  llm_balanced_acc = base_models %>% filter(family_size_and_tuning_mode == x) %>% pull(balanced_accuracy) %>% mean(na.rm = TRUE)
+  llm_family = base_models %>% filter(family_size_and_tuning_mode == x) %>% pull(llm_family) %>% as.character() %>% first()
+  return(c(llm_balanced_acc=llm_balanced_acc, llm_family=llm_family))
+}) 
+model_df=as.data.frame(t(model_df))
+model_df$llm_name = rownames(model_df)
+model_df$llm_balanced_acc = as.numeric(model_df$llm_balanced_acc)
+
+model_df = model_df %>%
+  filter(!is.na(llm_balanced_acc) & !is.nan(llm_balanced_acc)) %>%
+  arrange(llm_balanced_acc) %>%
+  mutate(llm_family = as.factor(llm_family)) %>%
+  mutate(llm_name = sub("-base$", "", llm_name))
+
+fig_sx = ggplot(model_df, aes(
+    y = llm_balanced_acc, 
+    x = reorder(llm_name, llm_balanced_acc, decreasing = TRUE), 
+    fill = llm_family)) +
+  geom_bar(stat = "identity") +
+  coord_cartesian(ylim = c(0.3, 1)) +  # This adjusts the visible range only
+  scale_fill_viridis_d(option = "plasma") +
+  ylab("Overall Balanced Accuracy [ratio]") +
+  xlab("Base Model") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 10, angle = 90, hjust = 1),
+        legend.position = "right") +
+  labs(fill = "Model Family")
+
+print(fig_sx)
+
+
+```
+
+
+### Fig 4B
+```{r fig.height=4, fig.width=18}
+
+# 1. Collapse perf_df over all scenarios: take mean balanced_accuracy per model
+heat_df <- perf_df %>%
+  filter(tuning_mode %in% c("base", "prompt-tuned")) %>% 
+  filter(has_prompt_tuned_model & !has_fine_tuned_model) %>%
+  filter(!is_re_run) %>%
+  group_by(llm_family, llm_tokens, tuning_mode, family_size_and_tuning_mode, has_fine_tuned_model) %>%
+  summarise(mean_ba = mean(balanced_accuracy, na.rm=TRUE), .groups="drop") %>%
+  arrange(llm_family, llm_tokens, tuning_mode)
+
+# 2. Plot: x = tokens, y = tuning_mode, fill = mean_ba; facet by family
+ggplot(heat_df, aes(
+    x = factor(llm_tokens),      # model size (number of parameters)s on the x‐axis
+    y = tuning_mode,             # tuning modes on the y‐axis
+    fill = mean_ba
+  )) +
+  geom_tile(color="white") +
+  facet_wrap(~ llm_family, scales = "free_x", nrow = 1) +
+  scale_fill_viridis(name="Bal. Accuracy", option="plasma", limits=c(0,1)) +
+  labs(
+    x = "Parameters (B)", 
+    y = "Tuning Mode", 
+    title = "Model Balanced Accuracy by Model Size & Tuning Mode",
+    subtitle = "Faceted by LLM Family"
+  ) +
+  theme_minimal(base_size=12) +
+  theme(
+    axis.text.x = element_text(angle=45, hjust=1, size=8),
+    axis.text.y = element_text(size=9),
+    strip.text = element_text(face="bold", size=10),
+    panel.grid = element_blank()
+  )
+
+# 1. Collapse perf_df over all scenarios: take mean balanced_accuracy per model
+heat_df <- perf_df %>%
+  #filter(tuning_mode %in% c("fine-tuned", "fine- and prompt-tuned")) %>% 
+  filter(has_fine_tuned_model) %>%
+  filter(!is_re_run) %>%
+  group_by(llm_family, llm_tokens, tuning_mode, family_size_and_tuning_mode, has_fine_tuned_model) %>%
+  summarise(mean_ba = mean(balanced_accuracy, na.rm=TRUE), .groups="drop") %>%
+  arrange(llm_family, llm_tokens, tuning_mode)
+
+# 2. Plot: x = tokens, y = tuning_mode, fill = mean_ba; facet by family
+fig4_b = ggplot(heat_df, aes(
+    x = factor(llm_tokens),      # model sizes on the x‐axis
+    y = tuning_mode,             # tuning modes on the y‐axis
+    fill = mean_ba
+  )) +
+  geom_tile(color="white") +
+  facet_wrap(~ llm_family, scales = "free_x", nrow = 1) +
+  scale_fill_viridis(name="Bal. Accuracy", option="plasma", limits=c(0,1)) +
+  labs(
+    x = "Parameters (B)", 
+    y = "Tuning Mode", 
+    #title = "Model Balanced Accuracy by Model Size & Tuning Mode",
+    #subtitle = "Faceted by LLM Family"
+  ) +
+  theme_minimal(base_size=12) +
+  theme(
+    axis.text.x = element_text(angle=45, hjust=1, size=8),
+    axis.text.y = element_text(size=9),
+    strip.text = element_text(face="bold", size=10),
+    panel.grid = element_blank()
+  )
+
+print(fig4_b)
+```
+
+
+### Fig 4B - Alternative
+```{r fig.height=5, fig.width=14}
+
+# 1. Collapse perf_df over all scenarios:
+bar_df <- perf_df %>%
+  filter(has_fine_tuned_model) %>%
+  group_by(llm_family, llm_tokens, tuning_mode, family_size_and_tuning_mode) %>%
+  summarise(
+    mean_ba = mean(balanced_accuracy, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(llm_family, llm_tokens, tuning_mode)
+
+# 2. Plot grouped barplot
+fig4_b_2 = ggplot(bar_df, aes(
+    x    = factor(llm_tokens),
+    y    = mean_ba,
+    fill = tuning_mode
+  )) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width    = 0.7
+  ) +
+  facet_wrap(~ llm_family, scales = "free_x", nrow = 1) +
+  scale_fill_viridis_d(
+    name   = "Tuning Mode",
+    option = "plasma",
+    begin  = 0.2,
+    end    = 0.8
+  ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    limits = c(0, 1)
+  ) +
+  labs(
+    x        = "Parameters (B)",
+    y        = "Mean Balanced Accuracy",
+    #title    = "Model Balanced Accuracy by Model Size & Tuning Mode",
+    #subtitle = "Faceted by LLM Family"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x        = element_text(angle = 45, hjust = 1, size = 8),
+    axis.title.y       = element_text(
+                           margin = ggplot2::margin(t = 0, r = 10, b = 0, l = 0)
+                         ),
+    strip.text         = element_text(face = "bold", size = 10),
+    legend.position    = "top",
+    panel.grid.major.x = element_blank()
+  )
+
+print(fig4_b_2)
+```
+
+### Fig. S3. All PPV & NPV
+
+```{r fig.height=20, fig.width=20}
+# Filter and prepare the data for plotting
+tuned_models = perf_df %>%
+  pull(model_base)
+
+plot_df = perf_df %>% 
+     #filter(npv > 0.9 & ppv > 0.5) %>% 
+     filter(model_base %in% tuned_models) %>%
+     filter(tuning_mode %in% c("fine-tuned", "base", "prompt-tuned", "fine- and prompt-tuned")) %>%
+     mutate(tuning_mode = factor(tuning_mode, levels = c("base", "prompt-tuned", "fine-tuned", "fine- and prompt-tuned"))) %>%
+     filter(scenario == "pe_ctpa")
+
+fig_s3 = ggscatter(
+              plot_df,
+              x = "npv",
+              y = "ppv",
+              label = "family_and_size",
+              repel = TRUE,
+              color = "llm_family",
+              shape = "tuning_mode",
+              palette = "npj",
+              xlab = "NPV [ratio]", ylab = "PPV [ratio]",
+              #xlim=c(0.9,1), ylim=c(0.19,0.52),
+            ) +
+    labs(
+                shape = "Tuning mode",
+                color = "LLM family"
+    ) +
+  theme_minimal(base_size = 15)
+
+print(fig_s3)
+ggsave("figures/fig_s3.jpg", fig_s3, device = "jpg", height = 20, width = 20, dpi = 300, create.dir = TRUE)
+  # theme(legend.position = "none")
+```
+
+**Fig. S3**: This figure shows the relationship between Negative Predictive Value (NPV) and Positive Predictive Value (PPV) for models in four different tuning modes: "base", "prompt-tuned", "fine-tuned", and "fine- and prompt-tuned". The scatter plot includes points colored by LLM family and shaped by tuning mode. The x-axis represents the NPV ratio, and the y-axis represents the PPV ratio. The plot is limited to NPV and PPV values between 0 and 1. Spearman's correlation method is used to assess the relationship between NPV and PPV.
+
+## Determinants of bACC
+
+### Fig. 4-2. Feature Importance for Accuracy
+
+```{r fig.height=8, fig.width=16}
+# Convert categorical variables to factors
+perf_df$model = as.factor(perf_df$model)
+perf_df$scenario = as.factor(perf_df$scenario)
+perf_df$llm_family = as.factor(perf_df$llm_family)
+perf_df$tuning_mode = as.factor(perf_df$tuning_mode)
+
+model_df = perf_df[,c("scenario", "llm_tokens", "llm_family", "tuning_mode", "balanced_accuracy")] %>%
+    filter(!is.na(balanced_accuracy))
+
+# Create a model matrix for the features
+features = model.matrix(~ 
+                             scenario +
+                             llm_tokens +
+                             llm_family +
+                             tuning_mode
+                         , data=model_df)[,-1]
+target = model_df$balanced_accuracy
+
+set.seed(123) # For reproducibility
+rf_model = randomForest(features, target, importance=TRUE)
+
+# Extract importance and p-values
+min_depth_frame = min_depth_distribution(rf_model)
+importance = importance(rf_model) %>% as.data.frame()
+importance$variable = rownames(importance)
+importance_frame = measure_importance(rf_model)
+importance_frame = importance_frame %>% left_join(importance, by = "variable")
+
+
+# Make variable names more readable
+make_readable = function(name) {
+  name = gsub("_", "-", name)
+  name = gsub("llm_tokens", "Number of Parameters", name, ignore.case = TRUE)
+  name = gsub("llm-family", "LLM-Family: ", name, ignore.case = TRUE)
+  name = gsub("tuning-mode", "Tuning Mode: ", name, ignore.case = TRUE)
+  if (grepl("scenario", name)){
+    name = toupper(name)
+    name = gsub("scenario", "Scenario: ", name, ignore.case = TRUE)
+  }
+  name = tools::toTitleCase(name)
+  return(name)
+}
+importance_frame$variable  = sapply(importance_frame$variable, make_readable)
+importance_frame$significant = importance_frame$p_value < 0.05
+importance_frame = importance_frame %>% mutate(variable = gsub("Llm-Tokens", "Model size (parameters)", variable))
+
+# Plotting the feature importance with IncNodePurity and outlining significant bars
+p1 = ggplot(importance_frame, aes(x = reorder(variable, `%IncMSE`), y = `%IncMSE`, fill = IncNodePurity, color = significant, linetype = significant)) +
+    geom_bar(stat = 'identity', size = 0.7) +
+    scale_color_manual(values = c("FALSE" = "white", "TRUE" = "red"), name = "Significant") +
+    scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dotted"), name = "Significant") +
+    coord_flip() +
+    xlab('Variables') +
+    ylab('Importance [%IncMSE]') +
+    scale_fill_viridis_c(option = "plasma", name = "IncNodePurity") +
+    theme_minimal() +
+    theme(legend.position = "left")
+
+p2 = plot_multi_way_importance(importance_frame, size_measure = "no_of_nodes") +
+    ggtitle("") +
+    ylab('Times as Root') +
+    xlab('Mean Min Depth') +
+    theme(legend.position = "right") +
+    labs(size = "No. of Nodes")
+
+p3 = plot_multi_way_importance(importance_frame, x_measure = "mse_increase", y_measure = "node_purity_increase", size_measure = "p_value", no_of_labels = 5) +
+    ggtitle("") +
+    ylab('IncNodePurity') +
+    xlab('%IncMSE') +
+    theme(legend.position = "right")+
+    labs(colour = "P-Value")
+
+p4 = ggarrange(plotlist = list(p2, p3), ncol = 1, nrow = 2, labels = c("D", "E"))
+fig4_2 = ggarrange(plotlist = list(p1, p4), ncol = 2, nrow = 1, labels = c("C", ""))
+fig4_2
+```
+
+**Fig. 4-2. Feature Importance for Balanced Accuracy**. (A) Feature importance is shown as %IncMSE (Percentage Increase in Mean Squared Error) with color coded IncNodePurity (Increase in Node Purity). Statistically significant features (p-value \< 0.05) are highlighted in red. (B) Multi-way-importance plot with mean-min-depth and times as root for each feature. (C) Multi-way-importance plot with %IncMSE over IncNodePurity.
+
+Note: %IncMSE (Percentage Increase in Mean Squared Error) measures the increase in the model's prediction error when a specific feature is randomly permuted, indicating its importance to the model's accuracy. IncNodePurity (Increase in Node Purity) quantifies the total reduction in node impurity, such as Gini impurity or variance, resulting from splits on a particular feature across all trees in the random forest. Higher values for both metrics signify that the feature significantly contributes to the model's performance.
+
+### Fig. 4
+
+```{r fig.height=18, fig.width=16}
+fig4_1 = ggarrange(
+  fig4_a, fig4_b,
+  ncol = 1,
+  labels = c("A", "B"),
+  heights = c(.70, .30)
+)
+
+fig4 = ggarrange(
+  fig4_1, fig4_2,
+  ncol = 1,
+  heights = c(.60, .40)
+)
+
+ggsave("figures/fig4.jpg", fig4, device = "jpg", height = 18, width = 16, dpi = 300, create.dir = TRUE)
+print(fig4)
+```
+
+**Fig. 4. Performance Metrics and Feature Importance for Balanced Accuracy**. (A) This figure shows the relationship between sensitivity and specificity for models in four different tuning modes: "base", "prompt-tuned", "fine-tuned", and "fine- and prompt-tuned". The scatter plot includes points colored by LLM family and shaped by tuning mode. The x-axis represents the sensitivity, and the y-axis represents the specificity. The plot is limited to sensitivity and specificity values between 0.5 and 1. (B) Overall balanced accuracy of all included models sorted from highest to lowest. It averages the balanced accuracy of each model over the different decision scenarios. (C) Feature importance was computed using random forests. Feature importance is shown as %IncMSE (Percentage Increase in Mean Squared Error) with color coded IncNodePurity (Increase in Node Purity). Statistically significant features (p-value < 0.05) are highlighted in red. (D) Multi-way-importance plot with mean-min-depth and times as root for each feature. (E) Multi-way-importance plot with %IncMSE over IncNodePurity.
+
+Note: %IncMSE (Percentage Increase in Mean Squared Error) measures the increase in the model's prediction error when a specific feature is randomly permuted, indicating its importance to the model's accuracy. IncNodePurity (Increase in Node Purity) quantifies the total reduction in node impurity, such as Gini impurity or variance, resulting from splits on a particular feature across all trees in the random forest. Higher values for both metrics signify that the feature significantly contributes to the model's performance.
+
+## Determinants of Sensitivity
+
+### Fig. S5. Feature Importance for Sensitivity
+
+```{r fig.height=7, fig.width=16}
+# Convert categorical variables to factors
+perf_df$model = as.factor(perf_df$model)
+perf_df$scenario = as.factor(perf_df$scenario)
+perf_df$llm_family = as.factor(perf_df$llm_family)
+perf_df$tuning_mode = as.factor(perf_df$tuning_mode)
+
+model_df = perf_df[,c("scenario", "llm_tokens", "llm_family", "tuning_mode", "sensitivity")] %>%
+    filter(!is.na(sensitivity))
+
+# Create a model matrix for the features
+features = model.matrix(~ 
+                             scenario +
+                             llm_tokens +
+                             llm_family +
+                             tuning_mode
+                         , data=model_df)[,-1]
+target = model_df$sensitivity
+
+set.seed(123) # For reproducibility
+rf_model = randomForest(features, target, importance=TRUE)
+
+# Extract importance and p-values
+min_depth_frame = min_depth_distribution(rf_model)
+importance = importance(rf_model) %>% as.data.frame()
+importance$variable = rownames(importance)
+importance_frame = measure_importance(rf_model)
+importance_frame = importance_frame %>% left_join(importance, by = "variable")
+
+# Make variable names more readable
+make_readable = function(name) {
+  name = gsub("_", "-", name)
+  name = gsub("llm_tokens", "Number of Parameters", name, ignore.case = TRUE)
+  name = gsub("llm-family", "LLM-Family: ", name, ignore.case = TRUE)
+  name = gsub("tuning-mode", "Tuning Mode: ", name, ignore.case = TRUE)
+  if (grepl("scenario", name)){
+    name = toupper(name)
+    name = gsub("scenario", "Scenario: ", name, ignore.case = TRUE)
+  }
+  name = tools::toTitleCase(name)
+  return(name)
+}
+importance_frame$variable  = sapply(importance_frame$variable, make_readable)
+importance_frame$significant = importance_frame$p_value < 0.05
+importance_frame = importance_frame %>% mutate(variable = gsub("Llm-Tokens", "Model size (parameters)", variable))
+
+# Plotting the feature importance with IncNodePurity and outlining significant bars
+p1 = ggplot(importance_frame, aes(x = reorder(variable, `%IncMSE`), y = `%IncMSE`, fill = IncNodePurity, color = significant, linetype = significant)) +
+    geom_bar(stat = 'identity', size = 0.7) +
+    scale_color_manual(values = c("FALSE" = "white", "TRUE" = "red"), name = "Significant") +
+    scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dotted"), name = "Significant") +
+    coord_flip() +
+    xlab('Variables') +
+    ylab('Importance [%IncMSE]') +
+    scale_fill_viridis_c(option = "plasma", name = "IncNodePurity") +
+    theme_minimal() +
+    theme(legend.position = "left")
+
+p2 = plot_multi_way_importance(importance_frame, size_measure = "no_of_nodes") +
+    ggtitle("") +
+    ylab('Times as Root') +
+    xlab('Mean Min Depth') +
+    theme(legend.position = "right") +
+    labs(size = "No. of Nodes")
+
+p3 = plot_multi_way_importance(importance_frame, x_measure = "mse_increase", y_measure = "node_purity_increase", size_measure = "p_value", no_of_labels = 5) +
+    ggtitle("") +
+    ylab('IncNodePurity') +
+    xlab('%IncMSE') +
+    theme(legend.position = "right")+
+    labs(colour = "P-Value")
+
+p4 = ggarrange(plotlist = list(p2, p3), ncol = 1, nrow = 2, labels = c("B", "C"))
+fig_s5 = ggarrange(plotlist = list(p1, p4), ncol = 2, nrow = 1, labels = c("A", ""))
+ggsave("figures/fig_s5.jpg", fig_s5, device = "jpg", height = 7, width = 16, dpi = 300, create.dir = TRUE)
+fig_s5
+```
+
+**Fig. S4. Feature Importance for Sensitivity**. (A) Feature importance is shown as %IncMSE (Percentage Increase in Mean Squared Error) with color coded IncNodePurity (Increase in Node Purity). Statistically significant features (p-value \< 0.05) are highlighted in red. (B) Multi-way-importance plot with mean-min-depth and times as root for each feature. (C) Multi-way-importance plot with %IncMSE over IncNodePurity.
+
+Note: %IncMSE (Percentage Increase in Mean Squared Error) measures the increase in the model's prediction error when a specific feature is randomly permuted, indicating its importance to the model's accuracy. IncNodePurity (Increase in Node Purity) quantifies the total reduction in node impurity, such as Gini impurity or variance, resulting from splits on a particular feature across all trees in the random forest. Higher values for both metrics signify that the feature significantly contributes to the model's performance.
+
+## Determinants of Specificity
+
+
+
+### Fig. SX. Feature Importance for Specificity
+
+```{r fig.height=7, fig.width=16}
+# Convert categorical variables to factors
+perf_df$model = as.factor(perf_df$model)
+perf_df$scenario = as.factor(perf_df$scenario)
+perf_df$llm_family = as.factor(perf_df$llm_family)
+perf_df$tuning_mode = as.factor(perf_df$tuning_mode)
+
+model_df = perf_df[,c("scenario", "llm_tokens", "llm_family", "tuning_mode", "specificity")] %>%
+    filter(!is.na(specificity))
+
+# Create a model matrix for the features
+features = model.matrix(~ 
+                             scenario +
+                             llm_tokens +
+                             llm_family +
+                             tuning_mode
+                         , data=model_df)[,-1]
+target = model_df$specificity
+
+set.seed(123) # For reproducibility
+rf_model = randomForest(features, target, importance=TRUE)
+
+# Extract importance and p-values
+min_depth_frame = min_depth_distribution(rf_model)
+importance = importance(rf_model) %>% as.data.frame()
+importance$variable = rownames(importance)
+importance_frame = measure_importance(rf_model)
+importance_frame = importance_frame %>% left_join(importance, by = "variable")
+
+
+# Make variable names more readable
+make_readable = function(name) {
+  name = gsub("_", "-", name)
+  name = gsub("llm_tokens", "Number of Parameters", name, ignore.case = TRUE)
+  name = gsub("llm-family", "LLM-Family: ", name, ignore.case = TRUE)
+  name = gsub("tuning-mode", "Tuning Mode: ", name, ignore.case = TRUE)
+  if (grepl("scenario", name)){
+    name = toupper(name)
+    name = gsub("scenario", "Scenario: ", name, ignore.case = TRUE)
+  }
+  name = tools::toTitleCase(name)
+  return(name)
+}
+importance_frame$variable  = sapply(importance_frame$variable, make_readable)
+importance_frame$significant = importance_frame$p_value < 0.05
+importance_frame = importance_frame %>% mutate(variable = gsub("Llm-Tokens", "Model size (parameters)", variable))
+
+# Plotting the feature importance with IncNodePurity and outlining significant bars
+p1 = ggplot(importance_frame, aes(x = reorder(variable, `%IncMSE`), y = `%IncMSE`, fill = IncNodePurity, color = significant, linetype = significant)) +
+    geom_bar(stat = 'identity', size = 0.7) +
+    scale_color_manual(values = c("FALSE" = "white", "TRUE" = "red"), name = "Significant") +
+    scale_linetype_manual(values = c("TRUE" = "solid", "FALSE" = "dotted"), name = "Significant") +
+    coord_flip() +
+    xlab('Variables') +
+    ylab('Importance [%IncMSE]') +
+    scale_fill_viridis_c(option = "plasma", name = "IncNodePurity") +
+    theme_minimal() +
+    theme(legend.position = "left")
+
+p2 = plot_multi_way_importance(importance_frame, size_measure = "no_of_nodes") +
+    ggtitle("") +
+    ylab('Times as Root') +
+    xlab('Mean Min Depth') +
+    theme(legend.position = "right") +
+    labs(size = "No. of Nodes")
+
+p3 = plot_multi_way_importance(importance_frame, x_measure = "mse_increase", y_measure = "node_purity_increase", size_measure = "p_value", no_of_labels = 5) +
+    ggtitle("") +
+    ylab('IncNodePurity') +
+    xlab('%IncMSE') +
+    theme(legend.position = "right")+
+    labs(colour = "P-Value")
+
+p4 = ggarrange(plotlist = list(p2, p3), ncol = 1, nrow = 2, labels = c("B", "C"))
+fig_sx = ggarrange(plotlist = list(p1, p4), ncol = 2, nrow = 1, labels = c("A", ""))
+
+# ggsave("figures/fig_sxxx.jpg", fig_s5, device = "jpg", height = 7, width = 16, dpi = 300, create.dir = TRUE)
+
+fig_sx
+```
+
+**Fig. SX. Feature Importance for Specificity**. (A) Feature importance is shown as %IncMSE (Percentage Increase in Mean Squared Error) with color coded IncNodePurity (Increase in Node Purity). Statistically significant features (p-value < 0.05) are highlighted in red. (B) Multi-way-importance plot with mean-min-depth and times as root for each feature. (C) Multi-way-importance plot with %IncMSE over IncNodePurity.
+
+Note: %IncMSE (Percentage Increase in Mean Squared Error) measures the increase in the model's prediction error when a specific feature is randomly permuted, indicating its importance to the model's accuracy. IncNodePurity (Increase in Node Purity) quantifies the total reduction in node impurity, such as Gini impurity or variance, resulting from splits on a particular feature across all trees in the random forest. Higher values for both metrics signify that the feature significantly contributes to the model's performance.
+
+## Agentic AI System
+
+### Sequential Empiric Updating
+
+```{r}
+# Format data
+target_list <- list(
+  evaluation_for_pe = c(scenario = "evaluation_for_pe", col = "outcome__eval_for_pe_required"),
+  pe_most_likely_diagnosis = c(scenario = "pe_most_likely_diagnosis", col = "assessment__pe_most_likely_diagnosis"),
+  pe_d_dimer = c(scenario = "pe_d_dimer", col = "outcome__pe_d_dimer_required"),
+  pe_ctpa = c(scenario = "pe_ctpa", col = "outcome__pulmonary_embolism")
+)
+
+# Filter and prepare the data for plotting
+tuned_models = perf_df %>% filter(tuning_mode %in% c("fine- and prompt-tuned")) %>% pull(model_base)
+tuned_models = perf_df %>% 
+     filter(model_base %in% tuned_models) %>% 
+     filter(!duplicated(model)) %>% 
+     pull(model) %>% as.character()
+
+# Initialize the results object.
+res_probs <- NULL
+
+# Loop through models and scenarios.
+for (i_model in tuned_models) {
+  resp_dat <- NULL
+  
+  
+  # skip, if model does not have expected responses
+  num_of_rows = sapply(target_list, function(x){
+      x=x[["scenario"]]
+      n_rows = llm_results %>% filter(model == i_model & llm_scenario == x) %>% nrow()
+    })
+  
+  if(any(num_of_rows == 0)){
+    paste0("The following scenarios of ",
+        i_model, " are empty:", paste(print(names(num_of_rows)[num_of_rows == 0])))
+  }
+  
+  if(!all(num_of_rows == 0)){
+        for (target in target_list) {
+                              tryCatch({
+                                 
+                                    # Subset the llm_results for rows corresponding to the current model and scenario.
+                                    resp_dat_i <- llm_results[llm_results$model == i_model & 
+                                                                llm_results$llm_scenario == target["scenario"],
+                                                              c("case_id", "validation__actual_bool_llm_response", "outcome__pulmonary_embolism")]
+                                    # Rename the response column to include the scenario.
+                                    names(resp_dat_i)[names(resp_dat_i) == "validation__actual_bool_llm_response"] <- paste0("response_", target["scenario"])
+                                    
+                                    # Merge with previously retrieved responses from other scenarios.
+                                    if (is.null(resp_dat)) {
+                                      resp_dat <- resp_dat_i
+                                    } else {
+                                      resp_dat <- full_join(resp_dat, resp_dat_i, by = c("case_id", "outcome__pulmonary_embolism"))
+                                }
+                              }, error = function(e) {
+                                message(paste("Error processing model:", i_model, "and scenario:", target["scenario"], ":", e$message))
+                              })
+            }
+                  
+            # Reorder columns to ensure the expected order.
+            resp_dat <- resp_dat[, c("case_id", 
+                                     "response_evaluation_for_pe", 
+                                     "response_pe_most_likely_diagnosis", 
+                                     "response_pe_d_dimer", 
+                                     "response_pe_ctpa",
+                                     "outcome__pulmonary_embolism")]
+            
+            # Define the (cumulative) response columns that you'll use for filtering.
+            response_cols <- c("response_evaluation_for_pe",  
+                               # "response_pe_most_likely_diagnosis",  # This column is commented in your example.
+                               "response_pe_d_dimer",  
+                               "response_pe_ctpa")
+            
+            # Calculate the base (prior) probability before any cumulative filtering.
+            probablities <- c(pi_prior_probability_pe = sum(resp_dat$outcome__pulmonary_embolism == 1, na.rm = T) / nrow(resp_dat))
+            
+            # Loop over each response column cumulatively.
+            for (i in response_cols) {
+              resp_dat <- resp_dat %>% filter(resp_dat[, i] == "yes")
+              p_i <- sum(resp_dat$outcome__pulmonary_embolism == 1, na.rm = T) / nrow(resp_dat)
+              names(p_i) <- i
+              probablities <- c(probablities, p_i)
+            }
+            
+            i_probs <- c(probablities)
+            
+            # Aggregate results. Here we assign the row name for the current model.
+            if (is.null(res_probs)) {
+              res_probs <- matrix(i_probs, nrow = 1)
+              rownames(res_probs) <- i_model
+            } else {
+              res_probs <- rbind(res_probs, i_probs)
+              rownames(res_probs)[nrow(res_probs)] <- i_model
+            }
+  }
+}
+
+rnms = rownames(res_probs)
+res_probs = as_tibble(res_probs, rownames = "model")
+res_probs_long <- res_probs %>%
+    filter(complete.cases(.)) %>%
+    pivot_longer(cols = starts_with(c("pi_prior_probability_pe", "response_")),
+                 names_to = "scenario", 
+                 values_to = "diagnostic_confidence")
+stepwise_probs = perf_df %>% 
+            filter(!duplicated(model)) %>%
+            select(model,
+                              tuning_mode,
+                              family_size_and_tuning_mode,
+                              family_and_size,
+                              starts_with("llm_")) %>%
+            right_join(res_probs_long, by="model") %>%
+     mutate(scenario = factor(scenario, 
+                              levels = c("pi_prior_probability_pe", "response_evaluation_for_pe", "response_pe_d_dimer", "response_pe_ctpa"), 
+                              labels = c("Baseline", "Evaluate for PE", "Get D-Dimer", "Order CTPA/VQ"))) %>%
+     group_by(scenario)
+
+# Create table with pagination, etc
+stepwise_probs_to_save = stepwise_probs %>% mutate(model = paste(family_and_size, tuning_mode, sep = "-"))
+DT::datatable(stepwise_probs_to_save, 
+          options = list(pageLength = 50,
+                        scrollX = TRUE,
+                        scrollY = "400px"))
+readr::write_csv(stepwise_probs_to_save, "results/stepwise_probs.csv")
+writexl::write_xlsx(stepwise_probs_to_save, "results/table_s2.xlsx")
+```
+
+### Fig. S6.
+
+```{r fig.height=24, fig.width=16}
+
+# Filter and prepare the data for plotting
+tuned_models = perf_df %>% filter(tuning_mode %in% c("fine- and prompt-tuned")) %>% pull(model_base)
+tuned_models = perf_df %>% 
+     filter(model_base %in% tuned_models) %>% 
+     filter(!duplicated(family_size_and_tuning_mode)) %>% 
+     pull(model)
+
+plot_df = perf_df %>% 
+     filter(model %in% tuned_models) %>%
+     filter(scenario %in% c("evaluation_for_pe", "pe_d_dimer", "pe_ctpa")) %>%
+     mutate(scenario = factor(scenario, 
+                              levels = c("evaluation_for_pe", "pe_d_dimer", "pe_ctpa"), 
+                              labels = c("Evaluate for PE", "Get D-Dimer", "Order CTPA/VQ"))) %>%
+     group_by(scenario)
+
+# Create the violin plot with paired comparison
+violin_plot_1 = ggplot(plot_df, aes(x = scenario, y = stepwise_balanced_accuracy)) +
+  geom_violin(alpha = 0.3, aes(fill = scenario)) +
+  geom_boxplot(width = 0.15, fill = "white") +
+  geom_point(alpha = 0.3, color="gray20") +
+  geom_line(alpha = 0.3, aes(group = model), linetype = "solid", color="gray20") +
+  stat_summary(fun = mean, geom = "line", aes(group = 1), color = "red", size = 1.5) +
+  labs(x = "", y = "Balanced Accuracy [ratio]") +
+  theme_minimal(base_size = 15) +
+  theme(legend.position = "none", axis.text.x = element_text(size = 0)) +
+  ylim(c(0,1.2)) +
+  stat_compare_means(method = "wilcox.test",
+                     label = "p.format",
+                     ref.group = "Evaluate for PE", 
+                     paired = TRUE,
+                     angle = 20,
+                     label.y = 1.1) +
+  facet_grid(.~llm_family)
+
+violin_plot_2 = ggplot(plot_df, aes(x = scenario, y = stepwise_sensitivity)) +
+  geom_violin(alpha = 0.3, aes(fill = scenario)) +
+  geom_boxplot(width = 0.15, fill = "white") +
+  geom_point(alpha = 0.3, color="gray20") +
+  geom_line(alpha = 0.3, aes(group = model), linetype = "solid", color="gray20") +
+  stat_summary(fun = mean, geom = "line", aes(group = 1), color = "red", size = 1.5) +
+  labs(x = "", y = "Sensitivity [ratio]") +
+  ylim(c(0,1.2)) +
+  theme_minimal(base_size = 15) +
+  theme(legend.position = "none", axis.text.x = element_text(size = 0)) +
+  stat_compare_means(method = "wilcox.test",
+                     label = "p.format",
+                     ref.group = "Evaluate for PE", 
+                     paired = TRUE,
+                     angle = 20,
+                     label.y = 1.1) +
+  facet_grid(.~llm_family)
+
+violin_plot_3 = ggplot(plot_df, aes(x = scenario, y = stepwise_specificity)) +
+  geom_violin(alpha = 0.3, aes(fill = scenario)) +
+  geom_boxplot(width = 0.15, fill = "white") +
+  geom_point(alpha = 0.3, color="gray20") +
+  geom_line(alpha = 0.3, aes(group = model), linetype = "solid", color="gray20") +
+  ylim(c(0,1.2)) +
+  stat_summary(fun = mean, geom = "line", aes(group = 1), color = "red", size = 1.5) +
+  labs(x = "Scenario", y = "Specificity [ratio]") +
+  theme_minimal(base_size = 15) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 35, hjust = 1)) +
+  stat_compare_means(method = "wilcox.test",
+                     label = "p.format",
+                     ref.group = "Evaluate for PE", 
+                     paired = TRUE,
+                     angle = 20,
+                     label.y = 1.1) +
+  facet_grid(.~llm_family)
+
+violin_plot_4 = ggplot(plot_df, aes(x = scenario, y = stepwise_ppv)) +
+  geom_violin(alpha = 0.3, aes(fill = scenario)) +
+  geom_boxplot(width = 0.15, fill = "white") +
+  geom_point(alpha = 0.3, color="gray20") +
+  geom_line(alpha = 0.3, aes(group = model), linetype = "solid", color="gray20") +
+  ylim(c(0,1.2)) +
+  stat_summary(fun = mean, geom = "line", aes(group = 1), color = "red", size = 1.5) +
+  labs(x = "Scenario", y = "PPV [ratio]") +
+  theme_minimal(base_size = 15) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 35, hjust = 1)) +
+  stat_compare_means(method = "wilcox.test",
+                     label = "p.format",
+                     ref.group = "Evaluate for PE", 
+                     paired = TRUE,
+                     angle = 20,
+                     label.y = 1.1) +
+  facet_grid(.~llm_family)
+
+violin_plot_5 = ggplot(plot_df, aes(x = scenario, y = stepwise_npv)) +
+  geom_violin(alpha = 0.3, aes(fill = scenario)) +
+  geom_boxplot(width = 0.15, fill = "white") +
+  geom_point(alpha = 0.3, color="gray20") +
+  geom_line(alpha = 0.3, aes(group = model), linetype = "solid", color="gray20") +
+  ylim(c(.5,1.2)) +
+  stat_summary(fun = mean, geom = "line", aes(group = 1), color = "red", size = 1.5) +
+  labs(x = "Scenario", y = "NPV [ratio]") +
+  theme_minimal(base_size = 15) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 35, hjust = 1)) +
+  stat_compare_means(method = "wilcox.test",
+                     label = "p.format",
+                     ref.group = "Evaluate for PE", 
+                     paired = TRUE,
+                     angle = 20,
+                     label.y = 1.1) +
+  facet_grid(.~llm_family)
+
+
+violin_plot_6 = stepwise_probs %>% filter(model %in% plot_df$model) %>% ggplot(aes(x = scenario, y = diagnostic_confidence)) +
+  geom_violin(alpha = 0.3, aes(fill = scenario)) +
+  geom_boxplot(width = 0.15, fill = "white") +
+  geom_point(alpha = 0.3, color="gray20") +
+  geom_line(alpha = 0.3, aes(group = model), linetype = "solid", color="gray20") +
+  stat_summary(fun = mean, geom = "line", aes(group = 1), color = "red", size = 1.5) +
+  labs(x = "Scenario", y = "Diagnostic Confidence [ratio]") +
+  ylim(c(0,0.37)) +
+  theme_minimal(base_size = 15) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 35, hjust = 1)) +
+  stat_compare_means(method = "wilcox.test",
+                     label = "p.format",
+                     ref.group = "Baseline", 
+                     paired = TRUE, 
+                     angle = 25,
+                     label.y = 0.34) +
+  facet_grid(.~llm_family)
+
+fig_s6 = ggarrange(plotlist = list(violin_plot_1,
+                                      violin_plot_2,
+                                      violin_plot_3,
+                                      violin_plot_4,
+                                      violin_plot_5,
+                                      violin_plot_6
+                                 ), ncol = 1, labels = c("A", "B", "C", "D", "E", "F"))
+ggsave("figures/fig_s6.jpg", fig_s6, device = "jpg", height = 24, width = 16, dpi = 300, create.dir = TRUE)
+
+print(fig_s6)
+```
+
+**Fig. S6 Stepwise Performance.** This figure illustrates the stepwise progression of model performance across three sequential and dependent decision steps. As the decision-making process evolves, cumulative errors can propagate and influence subsequent decisions. (A-C) Trends in overall balanced accuracy, sensitivity, and specificity are depicted, with the red line indicating aggregated performance across models. (D) Posterior diagnostic confidence distributions demonstrate how probability estimates update step by step, with the red line representing expected posterior confidence evolution. Statistical comparisons were conducted using paired, two-sided Wilcoxon signed-rank tests.
+
+
+<!-- ### Fig. S7. Step-wise Performance Changes -->
+
+<!-- ```{r fig.height=12, fig.width=16} -->
+
+<!-- # Create the violin plot with paired comparison -->
+<!-- violin_plot_2 = ggplot(plot_df, aes(x = scenario, y = stepwise_balanced_accuracy - balanced_accuracy)) + -->
+<!--   geom_violin(alpha = 0.3, aes(fill = scenario)) + -->
+<!--   geom_boxplot(width = 0.15, fill = "white") + -->
+<!--   geom_point(alpha = 0.3, color="gray20") + -->
+<!--   geom_line(alpha = 0.3, aes(group = model), linetype = "solid", color="gray20") + -->
+<!--   stat_summary(fun = mean, geom = "line", aes(group = 1), color = "red", size = 1.5) + -->
+<!--   labs(x = "", y = "Balanced Accuracy [ratio]") + -->
+<!--   ylim(c(NA,0.8)) + -->
+<!--   theme_minimal(base_size = 15) + -->
+<!--   theme(legend.position = "none", axis.text.x = element_text(size = 0)) + -->
+<!--   stat_compare_means(method = "wilcox.test", -->
+<!--                      label = "p.format", -->
+<!--                      ref.group = "Evaluate for PE",  -->
+<!--                      paired = TRUE, vjust = 0.5) + -->
+<!--   facet_grid(.~llm_family) -->
+
+<!-- violin_plot_3 = ggplot(plot_df, aes(x = scenario, y = stepwise_sensitivity - sensitivity)) + -->
+<!--   geom_violin(alpha = 0.3, aes(fill = scenario)) + -->
+<!--   geom_boxplot(width = 0.15, fill = "white") + -->
+<!--   geom_point(alpha = 0.3, color="gray20") + -->
+<!--   geom_line(alpha = 0.3, aes(group = model), linetype = "solid", color="gray20") + -->
+<!--   stat_summary(fun = mean, geom = "line", aes(group = 1), color = "red", size = 1.5) + -->
+<!--   labs(x = "", y = "Sensitivity [ratio]") + -->
+<!--   ylim(c(NA,0.1)) + -->
+<!--   theme_minimal(base_size = 15) + -->
+<!--   theme(legend.position = "none", axis.text.x = element_text(size = 0)) + -->
+<!--   stat_compare_means(method = "wilcox.test", -->
+<!--                      label = "p.format", -->
+<!--                      ref.group = "Evaluate for PE",  -->
+<!--                      paired = TRUE, vjust = 0.5) + -->
+<!--   facet_grid(.~llm_family) -->
+
+<!-- violin_plot_4 = ggplot(plot_df, aes(x = scenario, y = stepwise_specificity - specificity)) + -->
+<!--   geom_violin(alpha = 0.3, aes(fill = scenario)) + -->
+<!--   geom_boxplot(width = 0.15, fill = "white") + -->
+<!--   geom_point(alpha = 0.3, color="gray20") + -->
+<!--   geom_line(alpha = 0.3, aes(group = model), linetype = "solid", color="gray20") + -->
+<!--   stat_summary(fun = mean, geom = "line", aes(group = 1), color = "red", size = 1.5) + -->
+<!--   labs(x = "Scenario", y = "Specificity [ratio]") + -->
+<!--   ylim(c(NA,1.1)) + -->
+<!--   theme_minimal(base_size = 15) + -->
+<!--   theme(legend.position = "none", axis.text.x = element_text(angle = 35, hjust = 1)) + -->
+<!--   stat_compare_means(method = "wilcox.test", -->
+<!--                      label = "p.format", -->
+<!--                      ref.group = "Evaluate for PE",  -->
+<!--                      paired = TRUE, vjust = 0.5) + -->
+<!--   facet_grid(.~llm_family) -->
+
+<!-- fig_s7 = ggarrange(plotlist = list(violin_plot_2, violin_plot_3, violin_plot_4), ncol = 1, labels = c("A", "B", "C", "D")) -->
+
+<!-- ggsave("figures/fig_s7.jpg", fig_s7, device = "jpg", height = 12, width = 16, dpi = 300, create.dir = TRUE) -->
+
+<!-- print(fig_s7) -->
+<!-- ``` -->
+
+<!-- **Fig. S7 Step-wise Performance Changes**: This figure shows the step-wise changes in performance makers of models in three different, but dependent scenarios. As the decision process (or a line of thought) advances, previous mistakes may affect the subsequent decisions. -->
+
+
+
+## Clinical implications
+
+### Fig. 5A. CTPAs
+
+```{r fig.height=7, fig.width=14}
+
+# Read the data and filter the desired scenario
+llm_performance_data = perf_df %>%
+  filter(scenario == "pe_ctpa") %>% 
+  mutate(model = paste(family_and_size, tuning_mode, sep = "-"))
+
+# Select top 10 models based on stepwise_balanced_accuracy (with ctpa_diff < 100),
+# remove duplicate models and order by ctpa_diff_llm_minus_human (largest first)
+top_models <- llm_performance_data %>% filter(scenario == "pe_ctpa") %>%
+  filter(ctpa_diff_llm_minus_human < 250) %>%
+  filter(stepwise_balanced_accuracy >= 0.75) %>%
+  filter(llm_response_quality > 0.90) %>%
+  arrange(desc(stepwise_balanced_accuracy)) %>%
+  distinct(model, .keep_all = TRUE) %>%
+  mutate(model = factor(model,
+                        levels = unique(model[order(ctpa_diff_llm_minus_human, decreasing = TRUE)])))
+
+# Create the plot
+fig5_a = ggplot(top_models, aes(y = model, x = ctpa_diff_llm_minus_human, color = llm_family)) +
+  # Arrow segments 
+  geom_segment(aes(x = 0, xend = ctpa_diff_llm_minus_human, y = model, yend = model),
+               size = 2,
+               arrow = arrow(length = unit(0.3, "cm"), type = "closed")) +
+  geom_vline(xintercept = 0, color = "black", linetype = "dashed", size = 1) +
+  labs(
+    #title = "Top 10 LLM Models Ordered by CTPA Difference (LLM vs. Human)",
+    x = "CTPA Difference (LLM − Human)",
+    y = "Model",
+    color = "LLM Family"
+  ) +
+  # 95% CI
+  geom_errorbarh(
+    aes(xmin = ctpa_diff_llm_minus_human_lower_ci,
+        xmax = ctpa_diff_llm_minus_human_upper_ci),
+    height = 0.3,
+    color = "grey50",
+    size = 0.8,linetype = "dashed"
+  ) +
+  ggthemes::theme_economist_white() +
+  theme(
+    text = element_text(size = 14),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA),
+    plot.background  = element_rect(fill = "white", color = NA),
+    legend.background = element_rect(fill = "white", color = NA),
+    legend.key        = element_rect(fill = "white", color = NA)
+  ) +
+  scale_color_viridis_d(begin = 0, end = 0.8, option = "plasma")
+
+fig5_a
+```
+
+**Fig. 5A. Clinical implications.** Avoided CTPAs
+
+
+### Therapy metrics
+```{r}
+tx_data <- llm_results %>%
+  filter(llm_scenario == "pe_treatment" & is_re_run == FALSE) %>%
+  filter(outcome__pulmonary_embolism == 1) %>%
+  mutate(substance_class = get_anticoagulant_class(substance)) %>%
+  mutate(llm_family = as.factor(get_family(model))) %>%
+  mutate(substance = toupper(substance)) %>%
+  mutate(valid = ifelse(is_valid, "full", ifelse(substance_class != "OTHER", "partial", "invalid"))) %>%
+  mutate(substance_class_other = ifelse(substance_class != "OTHER", substance_class, substance))
+
+acc_by_model = tx_data %>%
+  group_by(model) %>%
+  summarise(
+    n_valid = sum(is_valid, na.rm = TRUE),
+    n_total = sum(!is.na(is_valid)),
+    n_valid_partial = sum(valid %in% c("partial", "full"), na.rm = TRUE),
+    FULL_ACC = n_valid / n_total,
+    PARTIAL_ACC = n_valid_partial / n_total,
+    .groups = "drop"
+  ) %>%
+  rowwise() %>%
+  mutate(
+    FULL_ACC_lower = binom.test(n_valid, n_total)$conf.int[1],
+    FULL_ACC_upper = binom.test(n_valid, n_total)$conf.int[2],
+    PARTIAL_ACC_lower = binom.test(n_valid_partial, n_total)$conf.int[1],
+    PARTIAL_ACC_upper = binom.test(n_valid_partial, n_total)$conf.int[2]
+  ) %>%
+  ungroup()
+
+DT::datatable(acc_by_model, 
+          options = list(pageLength = 50,
+                        scrollX = TRUE,
+                        scrollY = "400px"),
+          rownames = FALSE) %>%
+  DT::formatRound(columns = c("FULL_ACC", "PARTIAL_ACC", "FULL_ACC_lower", "FULL_ACC_upper", "PARTIAL_ACC_lower", "PARTIAL_ACC_upper"), digits = 2)
+```
+
+
+
+### Fig. 5B. Treatment: Correct Choice
+
+
+```{r fig.height=8, fig.width=10}
+
+# First merge the performance data with the accuracy data.
+tx_models <- acc_by_model %>% 
+  left_join(
+    perf_df[!duplicated(perf_df$model), 
+            c("model", "llm_family", "llm_tokens", "tuning_mode", 
+              "family_size_and_tuning_mode", "family_and_size")],
+    by = "model"
+  )
+
+# Filter and prepare the data for plotting.
+model_df <- tx_models %>% 
+  filter(!is.na(FULL_ACC)) %>% 
+  filter(FULL_ACC > 0.05) %>% 
+  arrange(group = llm_family, desc(FULL_ACC)) %>% 
+  mutate(
+    llm_family = as.factor(llm_family),
+    family_size_and_tuning_mode = as.factor(as.character(family_size_and_tuning_mode)),
+    family_and_size = as.factor(as.character(family_and_size)),
+    # Transform accuracy (scaled to 100) using a log10 scale
+    FULL_ACC_log = log10(FULL_ACC * 100)
+  )
+
+# Compute an id and angle for each observation.
+total <- nrow(model_df)
+df_radial <- model_df %>% 
+  mutate(
+    id = row_number(),
+    angle = (2 * pi * (id - 1)) / total,
+    x = FULL_ACC_log * cos(angle),
+    y = FULL_ACC_log * sin(angle)
+  )
+
+# Create concentric circle data for the radial grid using ggforce.
+max_radius <- max(df_radial$FULL_ACC_log, na.rm = TRUE)
+circle_data <- data.frame(r = seq(0, max_radius + 0.3, by = 0.3))
+
+# Build the radial plot.
+fig5_b <- ggplot(df_radial) +
+  # Add the reference circles in the background
+  geom_circle(aes(x0 = 0, y0 = 0, r = r), 
+              data = circle_data, 
+              color = "grey90", 
+              size = 0.4, 
+              inherit.aes = FALSE) +
+  # Draw segments from the center to each point.
+  geom_segment(aes(x = 0, y = 0, xend = x, yend = y, color = llm_family), size = 1) +
+  # Add the points.
+  geom_point(aes(x = x, y = y, color = llm_family, shape = tuning_mode), size = 4) +
+  # Replace geom_text_repel with geom_label_repel for badge-like labels.
+  geom_label_repel(aes(x = x, 
+                      y = y, 
+                      label = paste0(family_and_size, " (", round(FULL_ACC * 100, digits = 2), "%)"), 
+                      color = llm_family),
+                   size = 3,                        # text size inside the badge
+                   label.padding = unit(0.25, "lines"),  # internal padding
+                   label.r = unit(0.15, "lines"),        # corner rounding
+                   box.padding = 0.5,               # padding around the label box relative to the point
+                   point.padding = 0.5, 
+                   segment.alpha = 0.3,
+                   min.segment.length=0.05,
+                   segment.size = 1,
+                   # xlim = c(1, NA),               # Constrain the labale to outer rings
+                   #color = "black",                 # text color (adjust to "white" if needed)
+                   alpha = 1,                     # set label badges to 90% transparent (10% opaque)
+                   show.legend = FALSE) +
+  coord_fixed() +
+  theme_void() +
+  theme(legend.position = "right",
+        plot.background = element_rect(fill = "white", color = NA)) +
+  labs(#title = "Therapy: Top LLM Models",
+       color = "LLM Family",
+       shape = "Tuning Mode") +
+  # Apply the same color palette to both color and fill scales for consistency.
+  scale_color_viridis_d(begin = 0, end = 0.65, option = "plasma") +
+  scale_fill_viridis_d(begin = 0, end = 0.65, option = "plasma")
+
+# Display the plot
+print(fig5_b)
+```
+
+**Fig. 5B. Correct treatment decisions.** Correct substance, dosage and timing.
+
+
+### Fig 5B - Alternative
+```{r fig.height=7, fig.width=12}
+
+tx_models = acc_by_model %>% 
+  left_join(
+    perf_df[!duplicated(perf_df$model), 
+            c("model", "llm_family", "llm_tokens", "tuning_mode", 
+              "family_size_and_tuning_mode", "family_and_size")],
+    by = "model"
+  ) 
+
+model_df_2 <- tx_models %>% 
+  filter(!is.na(FULL_ACC)) %>% 
+  arrange(desc(FULL_ACC)) %>%
+  slice_head(n=40) %>%
+  mutate(family_size_and_tuning_mode = fct_reorder(family_size_and_tuning_mode, FULL_ACC, .desc = TRUE)) %>% 
+  mutate(
+    llm_family = as.factor(llm_family),
+    family_and_size = as.factor(as.character(family_and_size)),
+    FULL_ACC_log = log10(PARTIAL_ACC * 100)
+  ) %>% 
+  pivot_longer(
+    c("FULL_ACC", "PARTIAL_ACC"),
+    names_to = "type",
+    values_to = "tx_acc"
+  )
+
+lookup <- model_df_2 %>%
+    distinct(family_size_and_tuning_mode, family_and_size) %>%
+    arrange(factor(family_size_and_tuning_mode, levels = levels(model_df_2$family_size_and_tuning_mode)))
+lookup_vec <- setNames(lookup$family_and_size, lookup$family_size_and_tuning_mode)
+
+fig5_b_2 <- ggplot(model_df_2, aes(x = family_size_and_tuning_mode, y = tx_acc)) +
+  geom_segment(aes(y = 0, yend = tx_acc, color = llm_family, linetype = type), size = 1) +
+  geom_point(aes(color = llm_family, shape = tuning_mode), size = 4) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0, 1)
+  ) +
+  labs(
+    x = "Base Model",
+    y = "Accuracy [ratio]",
+    shape = "Tuning Mode",
+    color = "LLM Family",
+    linetype = "Accuracy Type"
+  ) +
+  theme_minimal(base_size = 12) +
+  scale_color_viridis_d(
+    option = "inferno",
+    begin  = 0.1,
+    end    = 0.8
+  ) +
+  theme(
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
+    axis.title.y    = element_text(margin = ggplot2::margin(t = 0, r = 10, b = 0, l = 0)),
+    strip.text      = element_text(face = "bold", size = 10),
+    legend.position = "right",
+    panel.grid.major.x = element_blank()
+  ) +
+  scale_x_discrete(labels = as.character(lookup_vec))
+
+print(fig5_b_2)
+
+```
+
+
+### Fig 5C Therapy Substances
+```{r fig.height=6, fig.width=6}
+# Create the doughnut pie chart
+fig5_c = pie_donut_full(tx_data, aes(valid, substance_class),
+         explode = 1, labelpositionThreshold=1.1,
+         showRatioThreshold = 0.05)
+```
+
+
+### Fig 5
+```{r fig.height=15, fig.width=18}
+fig5_bc = ggarrange(
+  fig5_b_2, fig5_c,
+  ncol = 2,
+  labels = c("B", "C"),
+  widths = c(.60, .40)
+)
+
+fig5 = ggarrange(
+  labels = c("A", ""),
+  fig5_a, fig5_bc,
+  ncol = 1,
+  heights = c(.50, .50)
+)
+
+ggsave("figures/fig5.jpg", fig5, device = "jpg", height = 15, width = 18, dpi = 300, create.dir = TRUE)
+
+med_and_iqr = paste0(
+  round(quantile(top_models$sensitivity, probs = c(.5, .25, .75))[[1]], digits = 2),
+  " [95%CI: ",
+  round(quantile(top_models$sensitivity, probs = c(.5, .25, .75))[[2]], digits = 2), ", ",
+  round(quantile(top_models$sensitivity, probs = c(.5, .25, .75))[[3]], digits = 2),
+  "]"
+)
+
+print(fig5)
+```
+**Fig. 5. Clinical Implications and Treatment Decisions**
+(A) Difference in decisions for CTPA between the LLM and human assessments. Negative values indicate that the LLM recommends fewer CTPAs compared to human evaluations. The error bars denote the 95% confidence intervals. Models with a minimum balanced accuracy across the entire decision chain of at least 75% were included (B). These models had a median overall sensitivity of `r med_and_iqr`. Accuracy of correct treatment decisions across LLM families and tuning modes. The full accuracy (correct substance, dosage, and timing) is represented as full line. Partial matches (only correct substance) are represented by dashed lines. (C) Distribution of DSA-recommended substances by substance class, and validation result across all responses.
+
+
+# Appendix
+
+## Synthetic data
+
+## Tabel 1 Patient characteristics
+
+General characteristics of the cohort.
+
+```{r}
+# Read synthetic data
+syn_data = read_csv("data/synthetic_dataframe.csv")
+syn_data$outcome__pulmonary_embolism = as.factor(syn_data$outcome__pulmonary_embolism)
+syn_data$demographic__sex = capitalize_first_char(syn_data$demographic__sex)
+syn_data = convert_to_factor(syn_data)
+syn_data$symptom__karnofsky_index_current = as.numeric(substr(syn_data$symptom__karnofsky_index_current, 1, 3)) 
+syn_data$history__hospitalization_at_onset = ifelse(
+    grepl("No hospitalization", syn_data$history__hospitalization, ignore.case = TRUE) | syn_data$history__hospitalization == "Unknown" | is.na(syn_data$history__hospitalization), 
+    "no", 
+    "yes"
+)
+
+# Define model for table one
+formula_compareGroups = c("outcome__pulmonary_embolism  ~ 
+                                demographic__age +
+                                demographic__sex +
+                                demographic__weight +
+                                demographic__height +
+                                sign__oxygen_saturation +
+                                sign__pulse_frequency +
+                                sign__hemoptysis +
+                                symptom__chest_pain +
+                                symptom__dyspnea +
+                                symptom__syncope +
+                                history__hospitalization_at_onset +
+                                history__immobilisation_or_surgery +
+                                history__previous_pe_or_dvt +
+                                assessment__pe_most_likely_diagnosis +
+                                lab__d_dimer
+                                ")
+
+# Create table
+compareGroups(data = syn_data, formula = formula_compareGroups, method = 2) %>%
+    createTable(hide.no = c("No", "FALSE")) %>%
+    export2md(header.labels = c(p.overall = "p-value"))
+```
+
+## Figure: Basic Characteristics:
+
+```{r}
+# Convert age to numeric and filter out ages >= 100
+ad_wide = syn_data %>%
+  mutate(
+    demographic__age = as.numeric(demographic__age),
+    demographic__sex = factor(demographic__sex, levels = c("Male", "Female"))
+  ) %>%
+  filter(demographic__sex != "Unknown") %>%
+  mutate(outcome__pulmonary_embolism = ifelse(outcome__pulmonary_embolism==TRUE, "PE", "non-PE")) %>%
+  mutate(outcome__pulmonary_embolism = as.factor(outcome__pulmonary_embolism))
+
+# Create the density plot with inverted axes and facets for sex at birth
+density_plot = ggplot(ad_wide, aes(x = demographic__age, fill = demographic__sex)) +
+  geom_density(data = subset(ad_wide, demographic__sex == "Male"), aes(y = -..density..), bw = 3.5, alpha = 0.7) +
+  geom_density(data = subset(ad_wide, demographic__sex == "Female"), aes(y = ..density..), bw = 3.5, alpha = 0.7) +
+  labs(title = "Age and Sex Distribution",
+       x = "Age at Inclusion",
+       y = "Density",
+       fill = "Sex at Birth",
+       subtitle = paste("Overall n =", nrow(ad_wide))) +
+  theme_minimal() +
+  coord_flip() +
+  scale_y_continuous(labels = abs) +
+  scale_fill_manual(values = c("Male" = "#E69F00", "Female" = "#56B4E9")) + 
+  geom_vline(xintercept=18, linetype='dashed') +
+  facet_wrap("outcome__pulmonary_embolism")
+
+density_plot
+```
